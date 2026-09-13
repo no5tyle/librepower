@@ -314,11 +314,11 @@ alone has no idea what battery is attached; the adapter alone does nothing
 without core.
 
 1. HACS → three-dot menu → **Custom repositories**
-2. Add `https://github.com/YOURNAME/librepower`, category **Integration**.
+2. Add `https://github.com/no5tyle/librepower`, category **Integration**.
    Download, restart Home Assistant, then Settings → Devices & Services →
    **Add Integration** → LibrePower, and set up pricing (fixed tariff or
    entity bridge)
-3. Add `https://github.com/YOURNAME/librepower-powerwall` (or whichever
+3. Add `https://github.com/no5tyle/librepower-powerwall` (or whichever
    battery brand applies), same custom-repository process, then **Add
    Integration** → LibrePower - Powerwall, and connect the Gateway
 
@@ -425,7 +425,7 @@ Scaffold. Not yet run against real hardware.
 
 Powerwall-adapter-specific gaps (pypowerwall field verification against live
 hardware, mocked-Gateway tests, the v1r pairing flow) now live in
-[librepower-powerwall's own README](https://github.com/YOURNAME/librepower-powerwall),
+[librepower-powerwall's own README](https://github.com/no5tyle/librepower-powerwall),
 not here — core has no Gateway-specific code left to have gaps in.
 
 ## Solar forecasting
