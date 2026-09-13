@@ -6,9 +6,19 @@
 
 PowerSync's equivalent file is ~900KB. This one is intentionally small, and the
 constraint that keeps it small is a rule: **this class orchestrates, it does not
-compute.** Telemetry lives in ``powerwall.py``, prices in ``pricing/``,
-forecasting in ``load_forecast.py``, the LP in ``optimiser/``. If this file
-starts growing a solver or a protocol, that logic is in the wrong place.
+compute.** Telemetry comes from whatever battery adapter registers (see
+battery.py for the contract - core itself imports no brand-specific module),
+prices from ``pricing/``, forecasting from ``load_forecast.py``, the LP from
+``optimiser/``. If this file starts growing a solver or a device protocol,
+that logic is in the wrong place.
+
+No battery until one registers
+-------------------------------
+Since the repo split, core no longer constructs a battery client itself - it
+starts with none, and a separate battery-adapter integration (e.g.
+``librepower-powerwall``) calls ``async_set_battery()`` once it has connected.
+Every method that needs a battery checks for this and fails informatively
+rather than crashing; ``control_mode`` reports ``"waiting"`` until then.
 
 Two update loops, deliberately separate:
   - fast: telemetry, every 30s, feeds the sensors and the load forecaster
@@ -18,11 +28,18 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .battery import (
+    BatteryClient,
+    BatteryControlUnavailableError,
+    BatteryError,
+    BatteryReadOnlyError,
+    BatterySnapshot,
+)
 from .const import (
     ACTION_CHARGE,
     ACTION_DISCHARGE,
@@ -39,13 +56,6 @@ from .const import (
 from .load_forecast import LoadForecaster
 from .open_meteo import OpenMeteoClient, OpenMeteoError
 from .optimiser import BatteryOptimiser, OptimizationConfig, OptimizationResult
-from .powerwall import (
-    PowerwallClient,
-    PowerwallError,
-    PowerwallReadOnlyError,
-    PowerwallSnapshot,
-    PowerwallV1rRequiredError,
-)
 from .pricing import PriceForecast, PricingError, PricingProvider
 from .solar_forecast import HistoricalSolarForecaster
 from .solar_geometry import clear_sky_ghi_estimate
@@ -59,13 +69,14 @@ SLOT_COUNT = int(OPTIMISE_HORIZON_HOURS * 60 / OPTIMISE_INTERVAL_MINUTES)
 class LibrePowerData:
     """Everything the entities render. One object, replaced atomically."""
 
-    snapshot: PowerwallSnapshot | None = None
+    snapshot: BatterySnapshot | None = None
     prices: PriceForecast | None = None
     plan: OptimizationResult | None = None
     plan_created: datetime | None = None
     current_action: str = ACTION_SELF_CONSUMPTION
     last_error: str | None = None
-    control_mode: str = "shadow"
+    # "waiting" until a battery adapter registers, then "shadow" or "active".
+    control_mode: str = "waiting"
     solar_forecast_source: str = SOLAR_FORECAST_SOURCE_CLIMATOLOGY
 
     @property
@@ -74,12 +85,11 @@ class LibrePowerData:
 
 
 class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
-    """Polls the Powerwall, refreshes prices, and re-solves the schedule."""
+    """Polls the registered battery, refreshes prices, and re-solves the schedule."""
 
     def __init__(
         self,
         hass: HomeAssistant,
-        powerwall: PowerwallClient,
         pricing: PricingProvider,
         optimiser_config: OptimizationConfig,
         loads: LoadForecaster,
@@ -95,7 +105,10 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
             name=DOMAIN,
             update_interval=UPDATE_INTERVAL_TELEMETRY,
         )
-        self._powerwall = powerwall
+        # No battery at construction time - core doesn't know about any
+        # specific brand. A battery adapter integration calls
+        # async_set_battery() once it has connected; see battery.py.
+        self._battery: BatteryClient | None = None
         self._pricing = pricing
         self._optimiser = BatteryOptimiser(optimiser_config)
         self._opt_config = optimiser_config
@@ -110,7 +123,7 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
         self._lon = longitude
         self._open_meteo = open_meteo
         self._weather_aware_solar = weather_aware_solar
-        self._last_v1r_warning: datetime | None = None
+        self._last_control_warning: datetime | None = None
         self.data = LibrePowerData()
 
     @property
@@ -124,18 +137,59 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
         return self._solar
 
     @property
+    def battery_ready(self) -> bool:
+        return self._battery is not None
+
+    async def async_set_battery(self, battery: BatteryClient) -> None:
+        """Called by a battery adapter integration once it has connected.
+
+        Fetches the adapter's reported physical capabilities (capacity, max
+        charge/discharge) and applies them to the optimiser config - these
+        are properties of the specific battery hardware, not something core
+        should be asking the user to type in blind. See battery.py's
+        docstring for why this is user-entered in the adapter, not
+        auto-detected from the device.
+        """
+        self._battery = battery
+        try:
+            caps = await battery.async_get_capabilities()
+        except BatteryError as err:
+            _LOGGER.warning(
+                "Battery registered but capabilities unavailable, keeping "
+                "existing optimiser limits: %s",
+                err,
+            )
+        else:
+            self._opt_config.battery_capacity_wh = caps.capacity_wh
+            self._opt_config.max_charge_w = caps.max_charge_w
+            self._opt_config.max_discharge_w = caps.max_discharge_w
+        # Kick the fast loop immediately rather than waiting up to 30s for
+        # the next scheduled tick - the person just finished setup and
+        # entities should populate right away.
+        await self.async_request_refresh()
+
+    @property
     def _control_mode(self) -> str:
         """Whether we are permitted to write to the battery."""
-        return "shadow" if self._powerwall.read_only else "active"
+        if self._battery is None:
+            return "waiting"
+        return "shadow" if self._battery.read_only else "active"
 
     # -- fast loop ------------------------------------------------------------
 
     async def _async_update_data(self) -> LibrePowerData:
         """Telemetry tick. Must stay cheap — it runs every 30 seconds."""
+        if self._battery is None:
+            raise UpdateFailed(
+                "No battery adapter registered yet - install a LibrePower "
+                "battery integration (e.g. librepower-powerwall) and "
+                "complete its setup."
+            )
+
         try:
-            snapshot = await self._powerwall.async_get_snapshot()
-        except PowerwallError as err:
-            raise UpdateFailed(f"Powerwall read failed: {err}") from err
+            snapshot = await self._battery.async_get_snapshot()
+        except BatteryError as err:
+            raise UpdateFailed(f"Battery read failed: {err}") from err
 
         now = datetime.now(timezone.utc)
         self._loads.observe(now, snapshot.load_w)
@@ -210,23 +264,23 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
             await self._async_execute_action(
                 self._action_now(plan, created), plan, created, snapshot
             )
-        except PowerwallReadOnlyError:
+        except BatteryReadOnlyError:
             pass  # expected and silent in shadow mode; no need to log every tick
-        except PowerwallV1rRequiredError as err:
+        except BatteryControlUnavailableError as err:
             # Distinct from a transient failure: this will not resolve on its
             # own on the next tick, so warn once per hour rather than every
             # 5 minutes, and say what actually needs to happen.
-            if self._last_v1r_warning is None or (
-                datetime.now(timezone.utc) - self._last_v1r_warning
+            if self._last_control_warning is None or (
+                datetime.now(timezone.utc) - self._last_control_warning
             ).total_seconds() > 3600:
                 _LOGGER.warning(
                     "Battery control unavailable: %s. Control mode is 'active' "
                     "but writes cannot reach the battery.",
                     err,
                 )
-                self._last_v1r_warning = datetime.now(timezone.utc)
-            self._record_error("Control enabled, but v1r pairing is required")
-        except PowerwallError as err:
+                self._last_control_warning = datetime.now(timezone.utc)
+            self._record_error(f"Control unavailable: {err}")
+        except BatteryError as err:
             _LOGGER.warning("Could not apply plan to battery: %s", err)
             self._record_error(f"Control write failed: {err}")
 
@@ -235,18 +289,20 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
         action: str,
         plan: OptimizationResult,
         created: datetime,
-        snapshot: PowerwallSnapshot,
+        snapshot: BatterySnapshot,
     ) -> None:
         """Translate the current plan slot into the one lever we pull.
 
-        Backup reserve is deliberately the only control surface:
+        Backup reserve is deliberately the only control surface this calls:
           - reserve above current SOC  -> holds / charges toward it
           - reserve at the floor       -> permits discharge for load and export
         This can't express every nuance the LP computed (it doesn't itself
-        command a charge *rate*), but it's the same lever PowerSync uses for
-        the same reason: it's the one write every Powerwall generation and
-        firmware version actually honours. Chase more granular control later
-        only if reserve-only proves insufficient in practice — not before.
+        command a charge *rate*), but every ``BatteryClient`` is required to
+        support it (see battery.py) precisely because it's the one write that
+        tends to survive across firmware/brand differences - PowerSync uses
+        the same lever on Powerwall for the same reason. An adapter is free
+        to do something smarter internally on top of the reserve target if
+        its hardware supports it; core only ever asks for this one thing.
         """
         index = self._slot_index(created)
         if index is None:
@@ -271,7 +327,7 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
         else:  # ACTION_IDLE
             reserve = snapshot.soc
 
-        await self._powerwall.async_set_backup_reserve(reserve)
+        await self._battery.async_set_backup_reserve(reserve)
 
     def _slot_index(self, created: datetime) -> int | None:
         if created is None:
@@ -417,4 +473,5 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
         )
 
     async def async_shutdown_client(self) -> None:
-        await self._powerwall.async_close()
+        if self._battery is not None:
+            await self._battery.async_close()

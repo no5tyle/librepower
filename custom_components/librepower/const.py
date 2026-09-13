@@ -11,23 +11,34 @@ DOMAIN = "librepower"
 
 # --- Config entry keys -------------------------------------------------------
 
-# Powerwall (local TEDAPI)
-CONF_GATEWAY_HOST = "gateway_host"
-CONF_GATEWAY_PASSWORD = "gateway_password"
-
 # Pricing provider
+#
+# Two provider types, both generic - neither is tied to any retailer brand:
+#   - fixed tariff:  a local time-of-use schedule the user types in from
+#                     their bill (formerly "GloBird support"; it was always
+#                     generic, just misleadingly named)
+#   - entity bridge:  reads price forecast data from an *existing* HA
+#                     integration's sensors (works with Amber's official
+#                     integration, or any other that publishes a forecast
+#                     attribute) rather than this project maintaining its own
+#                     retailer-specific API client
 CONF_PROVIDER = "provider"
-PROVIDER_AMBER = "amber"
-PROVIDER_GLOBIRD = "globird"
-PROVIDERS = [PROVIDER_AMBER, PROVIDER_GLOBIRD]
+PROVIDER_FIXED_TARIFF = "fixed_tariff"
+PROVIDER_ENTITY_BRIDGE = "entity_bridge"
+PROVIDERS = [PROVIDER_FIXED_TARIFF, PROVIDER_ENTITY_BRIDGE]
 
-CONF_AMBER_TOKEN = "amber_token"
-CONF_AMBER_SITE_ID = "amber_site_id"
+# Entity bridge configuration
+CONF_BRIDGE_IMPORT_ENTITY = "bridge_import_entity"
+CONF_BRIDGE_EXPORT_ENTITY = "bridge_export_entity"
+# Advanced/override fields - default to the validated Amber profile in
+# pricing/entity_bridge.py if not overridden.
+CONF_BRIDGE_FORECAST_ATTRIBUTE = "bridge_forecast_attribute"
+CONF_BRIDGE_START_TIME_FIELD = "bridge_start_time_field"
+CONF_BRIDGE_PRICE_FIELD = "bridge_price_field"
 
-# Battery physical parameters
-CONF_BATTERY_CAPACITY_WH = "battery_capacity_wh"
-CONF_MAX_CHARGE_W = "max_charge_w"
-CONF_MAX_DISCHARGE_W = "max_discharge_w"
+# Site policy (not hardware - battery physical specs like capacity and max
+# charge/discharge power are reported by whichever battery adapter is
+# registered, via BatteryClient.async_get_capabilities(). See battery.py.)
 CONF_BACKUP_RESERVE = "backup_reserve"
 
 # Optimiser tuning
@@ -49,12 +60,6 @@ DEFAULT_CONTROL_ENABLED = False
 
 # --- Defaults ----------------------------------------------------------------
 
-# Gateway's own WiFi AP address. Reachable when HA host has a route to it.
-DEFAULT_GATEWAY_HOST = "192.168.91.1"
-
-DEFAULT_BATTERY_CAPACITY_WH = 13500.0
-DEFAULT_MAX_CHARGE_W = 5000.0
-DEFAULT_MAX_DISCHARGE_W = 5000.0
 DEFAULT_BACKUP_RESERVE = 0.20
 
 # $/kWh of battery throughput charged against arbitrage. Keeps the optimiser
@@ -66,7 +71,9 @@ DEFAULT_CYCLE_COST = 0.02
 # Powerwall telemetry. Local TEDAPI is cheap but the gateway dislikes hammering.
 UPDATE_INTERVAL_TELEMETRY = timedelta(seconds=30)
 
-# Amber publishes 5-minute intervals; GloBird is a static ToU schedule.
+# Dynamic-price integrations (via the entity bridge) typically publish on a
+# 5-30 minute cadence; a fixed tariff schedule needs no polling at all, but
+# re-checking on this interval is cheap and keeps both providers on one path.
 UPDATE_INTERVAL_PRICES = timedelta(minutes=5)
 
 # Re-solve on a receding horizon. Cheaper than it sounds: ~1s for 48h at 30min.
@@ -76,10 +83,6 @@ UPDATE_INTERVAL_OPTIMISE = timedelta(minutes=5)
 
 OPTIMISE_HORIZON_HOURS = 48
 OPTIMISE_INTERVAL_MINUTES = 30
-
-# --- Amber API ---------------------------------------------------------------
-
-AMBER_API_BASE = "https://api.amber.com.au/v1"
 
 # --- Battery actions ---------------------------------------------------------
 

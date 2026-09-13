@@ -2,59 +2,31 @@
   "config": {
     "step": {
       "user": {
-        "title": "Connect your Powerwall",
-        "description": "LibrePower talks to the Gateway directly over your local network. You only need the Gateway password printed on the Powerwall itself — no Tesla account required.\n\nYour Home Assistant host must be able to reach the Gateway. If 192.168.91.1 doesn't respond, you may need a static route or to join the Gateway's WiFi network.",
+        "title": "Pricing source",
+        "description": "LibrePower core handles pricing and the optimiser. You'll also need a separate battery integration (e.g. librepower-powerwall) for it to actually see or control a battery - install that from HACS if you haven't already.",
         "data": {
-          "gateway_host": "Gateway address",
-          "gateway_password": "Gateway password"
+          "provider": "How should LibrePower get prices?"
         }
       },
-      "provider": {
-        "title": "Electricity retailer",
+      "entity_bridge": {
+        "title": "Read prices from an existing integration",
+        "description": "Pick the sensors that hold your import and export price forecasts. This works out of the box with Amber Electric's official integration - no API key needed here, since Amber's own integration already handles that. If you're using a different integration and it doesn't work, the field names it expects can be adjusted afterwards in the integration options.",
         "data": {
-          "provider": "Retailer"
+          "bridge_import_entity": "Import price sensor",
+          "bridge_export_entity": "Export (feed-in) price sensor"
         }
       },
-      "amber": {
-        "title": "Amber Electric",
-        "description": "Create a token at app.amber.com.au → Settings → API.",
-        "data": {
-          "amber_token": "API token"
-        }
-      },
-      "amber_site": {
-        "title": "Choose your site",
-        "data": {
-          "amber_site_id": "Site"
-        }
-      },
-      "globird": {
-        "title": "GloBird tariff",
-        "description": "GloBird doesn't publish a price API, so enter the rates from your bill in dollars per kWh, GST inclusive. You can add peak and off-peak windows afterwards in the integration options.",
+      "fixed_tariff": {
+        "title": "Fixed tariff",
+        "description": "For a flat rate or time-of-use plan with no price API - enter the rates from your bill in dollars per kWh, GST inclusive. You can add peak and off-peak windows afterwards in the integration options.",
         "data": {
           "default_import_price": "Import rate ($/kWh)",
           "default_export_price": "Feed-in rate ($/kWh)"
         }
-      },
-      "reauth_confirm": {
-        "title": "Powerwall password changed",
-        "description": "The Gateway is no longer accepting the stored password. Re-enter the password printed on the Powerwall.",
-        "data": {
-          "gateway_password": "Gateway password"
-        }
       }
     },
     "error": {
-      "invalid_gateway_password": "The Gateway rejected that password. Check the sticker on the Powerwall — it's the full string, not just the last few characters.",
-      "gateway_unreachable": "Couldn't reach the Gateway at that address. Check that Home Assistant has a network route to it.",
-      "invalid_amber_token": "Amber rejected that API token.",
-      "amber_unavailable": "Couldn't reach the Amber API. Try again shortly.",
-      "no_amber_sites": "That Amber account has no sites on it.",
-      "unknown": "Unexpected error — check the Home Assistant logs."
-    },
-    "abort": {
-      "already_configured": "This Powerwall is already set up.",
-      "reauth_successful": "Reconnected to the Powerwall."
+      "entity_not_found": "That entity doesn't exist. Check the source integration is set up and the entity ID is correct."
     }
   },
   "options": {
@@ -68,18 +40,15 @@
       },
       "confirm_control": {
         "title": "Hand control to LibrePower?",
-        "description": "Only one integration may control a battery. If PowerSync (or anything else) is still managing this Powerwall, disable its optimiser first and confirm it has stopped writing.\n\nThis also requires v1r pairing (a one-time Fleet API key registration) - the same step PowerSync itself uses for control. Gateway-password-only setup can plan a schedule but cannot write it; enabling control without v1r configured will show 'Control enabled, but v1r pairing is required' on the integration.\n\nTwo optimisers on one battery will fight: each reads the other's change as an error and corrects it, and the battery cycles needlessly.\n\nLeave the box unticked to stay in shadow mode.",
+        "description": "Only one integration may control a battery. If another optimiser is still managing it, disable that first and confirm it has stopped writing.\n\nWhether a write actually reaches the battery also depends on the registered battery adapter - some hardware/pairing modes support read-only telemetry but not control writes. Check that adapter's own documentation if control stays unavailable after enabling this.\n\nTwo optimisers on one battery will fight: each reads the other's change as an error and corrects it, and the battery cycles needlessly.\n\nLeave the box unticked to stay in shadow mode.",
         "data": {
           "understood": "No other integration is controlling this Powerwall"
         }
       },
-      "battery": {
-        "title": "Battery and optimiser",
-        "description": "Wear cost charges the optimiser for battery throughput so it won't chase arbitrage that costs more in cell degradation than it earns. Around 0.02 $/kWh is a reasonable starting point for LFP; set 0 to disable.\n\nWeather-aware solar forecasting uses Open-Meteo (no account or API key needed) to adjust the history-based solar forecast for tomorrow's actual weather, rather than just typical conditions for the season. Off by default - the history-based forecast works fully offline either way; this only sharpens it. If Open-Meteo is unreachable, the integration silently falls back to history-only.",
+      "tuning": {
+        "title": "Optimiser tuning",
+        "description": "Wear cost charges the optimiser for battery throughput so it won't chase arbitrage that costs more in cell degradation than it earns. Around 0.02 $/kWh is a reasonable starting point for LFP; set 0 to disable.\n\nWeather-aware solar forecasting uses Open-Meteo (no account or API key needed) to adjust the history-based solar forecast for tomorrow's actual weather, rather than just typical conditions for the season. Off by default - the history-based forecast works fully offline either way; this only sharpens it. If Open-Meteo is unreachable, the integration silently falls back to history-only.\n\nBattery capacity and charge/discharge limits are not set here - they're reported automatically by whichever battery adapter is registered.",
         "data": {
-          "battery_capacity_wh": "Battery capacity (Wh)",
-          "max_charge_w": "Maximum charge power (W)",
-          "max_discharge_w": "Maximum discharge power (W)",
           "backup_reserve": "Backup reserve (0-1)",
           "cycle_cost": "Battery wear cost ($/kWh cycled)",
           "weather_aware_solar": "Weather-aware solar forecast (Open-Meteo)"

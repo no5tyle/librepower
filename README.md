@@ -1,9 +1,35 @@
 # LibrePower
 
-Local-first battery optimisation for Home Assistant. Powerwall + Amber/GloBird.
+Local-first battery optimisation for Home Assistant. Core + battery adapters
++ pricing, split across repos on purpose — see "Why multiple repos" below.
 
-No cloud account. No third-party proxy. No subscription. The Gateway password
-on your Powerwall is the only credential needed for battery control.
+No cloud account required for telemetry. No third-party proxy. No
+subscription. This repo (core) contains the optimiser, coordinator, and
+pricing; it has no idea what battery brand, if any, is attached until a
+separate adapter integration registers one.
+
+## Why multiple repos
+
+The original single-repo design meant installing support for one battery
+brand and one pricing provider pulled in updates for every *other* brand and
+provider too — the exact HACS-update-noise problem this project set out to
+avoid in the first place, and a real, observed pattern in the incumbent
+alternative (PowerSync) this was compared against during design: commits for
+Sungrow, GoodWe, and Sigenergy support landing in the same repo as commits
+nobody using only a Powerwall would ever need.
+
+The split:
+
+| Part | Repo | Contains |
+|---|---|---|
+| **Core** (this repo) | `librepower` | Coordinator, optimiser, generic fixed-tariff and entity-bridge pricing, sensors, dashboard |
+| **Battery** | `librepower-powerwall` (one repo per brand) | Everything brand-specific — protocol, device control, hardware config |
+| **Provider** | *usually none needed* | Only for a retailer with neither an existing HA integration nor a usable public API — see "How pricing works" below |
+
+Core defines a `BatteryClient` contract (`battery.py`) that any adapter repo
+implements and registers against at runtime — core never imports a
+brand-specific module. See that file's docstring for the actual cross-repo
+mechanism and its honest limitations.
 
 ## Scope discipline
 
@@ -11,9 +37,9 @@ This project exists because the alternatives grew past the point where most
 people could understand or trust them. The rules that keep that from happening
 here:
 
-1. **One battery brand at a time.** Powerwall works properly before anything
-   else is started. A second brand is a new module implementing the same
-   interface, not a new branch inside an existing one.
+1. **One battery brand per repo.** A second brand is a new adapter repo
+   implementing `BatteryClient`, never a branch inside an existing one, and
+   never inside core.
 2. **Orchestrators don't compute.** `coordinator.py` wires modules together.
    Solvers, protocols, and forecasts live in their own files. If the
    coordinator grows maths, the maths is in the wrong place.
@@ -24,15 +50,16 @@ here:
 5. **Cloud dependencies are opt-in, never required.** If a feature can't work
    offline, it's a separate optional module.
 
-## Architecture
+## Architecture (core)
 
 ```
 custom_components/librepower/
-├── __init__.py           setup / teardown, wiring
-├── config_flow.py        guided setup: Powerwall → retailer
+├── __init__.py           setup / teardown, battery registration entry point
+├── config_flow.py        guided setup: pricing only (no battery step)
 ├── const.py              all tunables in one place
 ├── coordinator.py        two loops: 30s telemetry, 5min re-solve
-├── powerwall.py          local TEDAPI via pypowerwall (MIT dependency)
+├── battery.py            the contract adapter repos implement - core imports
+│                         no brand-specific module
 ├── load_forecast.py      per-slot median of observed load
 ├── solar_geometry.py     pure clear-sky elevation/GHI model, no network
 ├── solar_forecast.py     history-based solar learner (clear-sky-index)
@@ -45,60 +72,56 @@ custom_components/librepower/
 │   └── __init__.py
 └── pricing/
     ├── models.py         PriceForecast — the only type the optimiser sees
-    ├── amber.py          documented REST API
-    └── globird.py        local ToU schedule, no network
+    ├── fixed_tariff.py   generic flat/ToU schedule, no network (formerly
+    │                     "GloBird support" - it was always generic)
+    └── entity_bridge.py  reads price sensors from an existing HA integration
+                          (e.g. Amber's official one) instead of this project
+                          maintaining its own retailer API clients
 ```
 
-### How the Powerwall connection works
+### How battery adapters connect
 
-pypowerwall's **gateway-password TEDAPI mode** for telemetry: HTTP to the
-Gateway on your own network, authenticated with the password printed on the
-unit. No Tesla account needed to *read* solar/battery/grid/load power and SOC.
+`librepower-powerwall` (or any future brand's adapter) declares
+`"dependencies": ["librepower"]` in its own manifest, guaranteeing core loads
+first, then imports `battery.py`'s types directly via Home Assistant's shared
+`custom_components` namespace package and calls
+`async_register_battery(hass, core_entry_id, client)`. Until an adapter
+registers, core's sensors read `"waiting"` — that's the normal state right
+after core is first set up, not an error.
 
-**Control is a different story, and this was wrong in an earlier version of
-this README.** Every write — backup reserve, operation mode, grid export
-rule, islanding — requires pypowerwall's **v1r transport**, which needs an
-RSA key registered through Tesla's Fleet API. That's a one-time cloud
-handshake (physically confirmed by toggling the Gateway's DC isolator), not
-an ongoing dependency, but it is real: gateway-password-only setup can plan a
-schedule but cannot write it. This isn't a gap in this integration — it's how
-Tesla's local protocol is designed, and it's the same step PowerSync itself
-goes through for its own "local" control.
+Battery-physical specs (capacity, max charge/discharge) are reported by
+whichever adapter registers, via `BatteryClient.async_get_capabilities()` —
+not typed into core's own options. A Sigenergy install and a Powerwall
+install have different numbers; asking for them in core, disconnected from
+which battery is actually attached, was the wrong place for that config to
+live. See `battery.py`'s docstring for why this is adapter-entered rather
+than auto-detected (checked: pypowerwall has no nameplate-capacity API).
 
-If a write is attempted without v1r, pypowerwall doesn't raise — it logs an
-error and returns `None`, which would silently look like success. LibrePower
-checks for this explicitly and raises `PowerwallV1rRequiredError`, surfaced
-via `sensor.librepower_planned_action`'s status and throttled to one log line
-per hour rather than every 5-minute tick.
-
-**Solar curtailment**, since it's a common follow-up question: the Gateway
-supports two real mechanisms, both v1r-gated.
-- `async_set_grid_export("never")` — soft curtailment. Site stays
-  grid-connected; export is simply forbidden, and the Gateway curtails solar
-  production internally rather than overproduce with nowhere for the surplus
-  to go. This is what PowerSync uses for DC-coupled (Tesla-integrated) solar.
-- `async_go_off_grid()` — hard curtailment via full islanding. Same
-  underlying throttling, but drops the site off-grid entirely (no import
-  either). Reserved for cases the soft method can't reach — e.g. an
-  AC-coupled inverter on a separate circuit that keeps exporting regardless
-  of the Gateway's export rule. **This method has no safety gating of its own
-  by design** — a caller needs to add its own SOC floor and duration cap
-  before using it for anything automated. Not yet wired into the coordinator;
-  `optimiser/MODIFICATIONS.md` tracks it as planned work.
-
-Requirement either way: Home Assistant must have a network route to the
-Gateway (`192.168.91.1` by default).
+Everything about *how* a specific battery connects — local vs cloud
+transport, what control actually requires, curtailment mechanisms, and so on
+— now lives in that battery's own adapter repo, since core has no
+brand-specific knowledge at all. For Powerwall specifically, see
+[librepower-powerwall's README](https://github.com/YOURNAME/librepower-powerwall)
+for the full detail on gateway-password telemetry vs the v1r requirement for
+control, and the two curtailment mechanisms Tesla's Gateway supports.
 
 ### How pricing works
 
-Both retailers reduce to a `PriceForecast` — a list of intervals with import
-and export prices in $/kWh. The optimiser never knows which retailer it is.
+Both provider types reduce to a `PriceForecast` — a list of intervals with
+import and export prices in $/kWh. The optimiser never knows which one is in
+use, or which retailer, if any, is behind it.
 
-- **Amber**: documented REST API, 5-minute forward curve, regularly goes
-  negative on feed-in (which the optimiser must handle correctly — see
-  `MODIFICATIONS.md` item 3).
-- **GloBird**: no public price API. Rates come from the user's bill as a
-  time-of-use schedule and the curve is generated locally. Zero network calls.
+- **Fixed tariff** (`pricing/fixed_tariff.py`): a flat rate or time-of-use
+  schedule entered from the user's bill, generated locally. Zero network
+  calls. Works for any flat/ToU retailer, not tied to a brand.
+- **Entity bridge** (`pricing/entity_bridge.py`): reads price forecast data
+  from an *existing* Home Assistant integration's sensors, rather than this
+  project maintaining its own retailer API clients. Ships with a validated
+  profile for Amber Electric's official core integration (confirmed against
+  real community-reported attribute output, including that Amber's forecast
+  regularly goes negative on feed-in — handled correctly, see
+  `optimiser/MODIFICATIONS.md` item 3). A different integration's field names
+  can be set in options if they differ from Amber's shape.
 
 ### Credits
 
@@ -159,60 +182,87 @@ their source.
 
 ## Installing via HACS
 
-This is a custom repository, not in the default HACS store.
+Custom repositories, not in the default HACS store. Both are needed — core
+alone has no idea what battery is attached; the adapter alone does nothing
+without core.
 
 1. HACS → three-dot menu → **Custom repositories**
-2. URL: `https://github.com/YOURNAME/librepower`, category **Integration**
-3. Download LibrePower, restart Home Assistant
-4. Settings → Devices & Services → **Add Integration** → LibrePower
+2. Add `https://github.com/YOURNAME/librepower`, category **Integration**.
+   Download, restart Home Assistant, then Settings → Devices & Services →
+   **Add Integration** → LibrePower, and set up pricing (fixed tariff or
+   entity bridge)
+3. Add `https://github.com/YOURNAME/librepower-powerwall` (or whichever
+   battery brand applies), same custom-repository process, then **Add
+   Integration** → LibrePower - Powerwall, and connect the Gateway
+
+Order matters: core's config flow doesn't ask about batteries at all, so
+setting it up first with nothing installed for step 3 yet is completely
+normal — its sensors will simply read `"waiting"` until the battery adapter
+registers.
 
 ## Running alongside PowerSync
 
 Supported, and the recommended way to evaluate this. LibrePower ships in
 **shadow mode**: it reads telemetry, fetches prices, and solves the full
-schedule, but every write to the battery is blocked at the client level. You
-get a `sensor.librepower_planned_action` you can chart against what PowerSync
+schedule, but every write to the battery is blocked at the battery-adapter
+level (e.g. `librepower-powerwall`'s `powerwall.py`, not in core, since core
+has no battery client of its own). You get a
+`sensor.librepower_planned_action` you can chart against what PowerSync
 actually does, for as long as you want, with no risk of the two fighting.
 
 **No collisions:**
 
-| | PowerSync | LibrePower |
-|---|---|---|
-| Domain | `power_sync` | `librepower` |
-| Entity prefix | `power_sync_*` | `librepower_*` |
-| Config entries | separate | separate |
+| | PowerSync | LibrePower core | LibrePower Powerwall adapter |
+|---|---|---|---|
+| Domain | `power_sync` | `librepower` | `librepower_powerwall` |
+| Entity prefix | `power_sync_*` | `librepower_*` | (no entities of its own) |
+| Config entries | separate | separate | separate |
 
 **What to watch for:**
 
-- **Gateway polling.** Both integrations poll the same Gateway. LibrePower uses
-  a 30s interval; if you see timeouts or TEDAPI errors in either integration,
-  widen `UPDATE_INTERVAL_TELEMETRY` in `const.py` before blaming the hardware.
-- **Shared dependency: `highspy`.** Both pin it, and pip installs one copy into
-  the HA environment. LibrePower pins `>=1.7.0` to match PowerSync's floor so the
-  resolver has no conflict to solve.
-- **`cvxpy` is a heavy install** (pulls SciPy and a compiled solver stack).
-  First startup after installing will be slow. This is the main cost of the
-  vendored engine's modelling layer; dropping to raw `highspy` later would
-  remove it.
+- **Gateway polling.** Both PowerSync and the LibrePower Powerwall adapter
+  poll the same Gateway. The adapter uses a 30s interval; if you see timeouts
+  or TEDAPI errors in either integration, widen the telemetry interval in the
+  adapter's own `const.py` before blaming the hardware.
+- **Shared dependency: `highspy`.** Both pin it (core needs it for the
+  optimiser), and pip installs one copy into the HA environment. Core pins
+  `>=1.7.0` to match PowerSync's floor so the resolver has no conflict to
+  solve.
+- **`cvxpy` is a heavy install** (pulls SciPy and a compiled solver stack),
+  needed by core. First startup after installing will be slow. This is the
+  main cost of the vendored engine's modelling layer; dropping to raw
+  `highspy` later would remove it.
 - **Only one integration may control the battery.** When you are ready to
   switch, disable PowerSync's optimiser *first*, confirm it has stopped
-  writing, then enable control in LibrePower's options. Never both.
+  writing, then enable control in core's options *and* make sure the battery
+  adapter picks that setting up (see "Taking over control" below — this
+  isn't automatically live-reloaded yet). Never both.
 
 ### Taking over control
 
-Shadow mode is the default and is enforced in `powerwall.py`, not in a
-higher-level guard — a write cannot escape even if a future service handler
-calls the client directly. To go live, tick control in the integration's
-options, behind an explicit confirmation screen. `sensor.librepower_control_mode`
-reports `shadow` or `active` so the current state is never ambiguous.
+Shadow mode is the default, decided in core's options, but actually
+*enforced* in the registered battery adapter (e.g. `librepower-powerwall`'s
+`powerwall.py`) — a write cannot escape even if a future service handler
+calls the client directly, because core never holds a write-capable client of
+its own.
+
+**A real gap worth knowing about:** the adapter reads core's
+`control_enabled` setting once, at the adapter's own setup time — it is not
+currently live-reloaded if you change core's setting afterwards. Ticking
+control on in core's options, behind the explicit confirmation screen, is
+necessary but not by itself sufficient; the battery adapter integration
+needs a manual reload (Settings → Devices & Services → LibrePower - Powerwall
+→ reload) to pick up the new value. `sensor.librepower_control_mode` reports
+`shadow`, `active`, or `waiting` (no battery registered yet) so the current
+state is never ambiguous — check it after reloading, not just after changing
+the option.
 
 **What "active" actually does:** on each 5-minute re-solve, the coordinator
-reads the LP's target SOC for the current slot and sets the Gateway's backup
-reserve to it — raised above current SOC to force a charge, lowered to the
-plan's floor to permit discharge. That's the one lever pulled; the LP's
-richer output (planned charge/discharge *rate*, specifically) isn't
-commanded, only used to decide direction. If reserve-only proves too coarse
-in practice, that's the next control surface to add — not before.
+reads the LP's target SOC for the current slot and calls the registered
+battery's `async_set_backup_reserve()` — raised above current SOC to force a
+charge, lowered to the plan's floor to permit discharge. That's the one
+lever pulled; the LP's richer output (planned charge/discharge *rate*,
+specifically) isn't commanded, only used to decide direction.
 
 ## Status
 
@@ -220,19 +270,32 @@ Scaffold. Not yet run against real hardware.
 
 ### Next steps
 
-- [ ] Verify `pypowerwall` telemetry field names against a live Gateway
 - [ ] Confirm negative export prices flow correctly through the LP objective
 - [ ] Set a realistic default `cycle_cost` (upstream ships `0.0`)
 - [x] Solar forecast source — history-based clear-sky-index model, always on,
       zero network; Open-Meteo clearness-index adjustment, opt-in, no key
-- [x] Write the plan back to the Gateway (backup-reserve control, active mode)
-- [ ] GloBird ToU windows in the options flow
-- [ ] Tests with a mocked Gateway
+- [x] Write the plan back to the registered battery (backup-reserve control,
+      active mode)
+- [x] Split into core + battery-adapter repos, with a `BatteryClient`
+      contract (`battery.py`) any brand implements against
+- [ ] No unregister path: if a battery adapter is removed while core keeps
+      running, the coordinator has no way to know and keeps a stale
+      reference. `async_register_battery`'s docstring tracks this.
+- [ ] Control-setting live-reload: an adapter reads core's `control_enabled`
+      once, at its own setup time - not automatically reloaded if changed
+      afterwards. See "Taking over control" above.
+- [ ] Fixed-tariff ToU windows in the options flow (currently flat-rate only
+      via the config flow; peak/off-peak windows need adding there too)
 - [ ] Battery efficiency learned from telemetry (next item on the learning
       roadmap after solar — `charge_efficiency`/`discharge_efficiency` are
       still a hardcoded 0.90/0.90 in `OptimizationConfig`, never measured)
 - [ ] Load forecast recency weighting (exponential decay toward recent days)
 - [ ] Degradation/`cycle_cost` calibration from observed capacity fade
+
+Powerwall-adapter-specific gaps (pypowerwall field verification against live
+hardware, mocked-Gateway tests, the v1r pairing flow) now live in
+[librepower-powerwall's own README](https://github.com/YOURNAME/librepower-powerwall),
+not here — core has no Gateway-specific code left to have gaps in.
 
 ## Solar forecasting
 
@@ -283,9 +346,16 @@ single LibrePower config entry.
 
 ## Roadmap
 
-**v0.1** Powerwall + Amber, read-only plan as sensors.
+**v0.1** Single repo, Powerwall + Amber, read-only plan as sensors.
 **v0.2** Act on the plan via backup reserve.
-**v0.3** GloBird ToU, solar forecast.
-**v1.0** Hardware-verified, tested, documented.
+**v0.3** GloBird ToU (generalised to fixed-tariff), solar forecast.
+**v0.4** (current) Split into core + `librepower-powerwall`, generic
+fixed-tariff and entity-bridge pricing replacing brand-specific clients.
+**v1.0** Hardware-verified (a real two-repo HA install, not just the
+namespace-package sandbox this was verified against), tested, documented.
 
-Second battery brand comes after v1.0. Not before.
+A second battery brand no longer waits on v1.0 the way it used to — that was
+true when everything lived in one repo and a new brand meant touching shared
+code. Since the split, a second brand is a new adapter repo implementing
+`battery.py`'s contract, independent of core's own release cycle. Worth
+someone actually building one before calling that claim proven, though.

@@ -2,250 +2,132 @@
 # Copyright (C) 2026 LibrePower contributors
 # Full license: /LICENSE. Third-party exception (this file is NOT it): /NOTICE.
 
-"""Config flow: Powerwall first, then retailer.
+"""Core config flow: pricing setup only.
 
-Order matters. We validate the Powerwall connection before asking for retailer
-credentials, because a gateway that can't be reached is a hard blocker and
-there's no point collecting an Amber token the user can't use yet.
+Since the repo split, core has no battery-specific step here at all - that
+setup (gateway host/password, or whatever a given brand needs) lives entirely
+in the relevant battery-adapter integration's own config flow (e.g.
+librepower-powerwall). Core's first step is choosing a pricing source; core
+doesn't know or care what battery, if any, is attached until one registers.
 """
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.config_entries import (
-    ConfigEntry,
-    ConfigFlow,
-    ConfigFlowResult,
-    OptionsFlow,
-)
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.core import callback
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers import selector
 
 from .const import (
-    CONF_AMBER_SITE_ID,
-    CONF_AMBER_TOKEN,
     CONF_BACKUP_RESERVE,
-    CONF_BATTERY_CAPACITY_WH,
+    CONF_BRIDGE_EXPORT_ENTITY,
+    CONF_BRIDGE_IMPORT_ENTITY,
     CONF_CONTROL_ENABLED,
     CONF_CYCLE_COST,
-    CONF_GATEWAY_HOST,
-    CONF_GATEWAY_PASSWORD,
     CONF_PROVIDER,
-    CONF_MAX_CHARGE_W,
-    CONF_MAX_DISCHARGE_W,
     CONF_WEATHER_AWARE_SOLAR,
     DEFAULT_BACKUP_RESERVE,
-    DEFAULT_BATTERY_CAPACITY_WH,
     DEFAULT_CONTROL_ENABLED,
     DEFAULT_CYCLE_COST,
-    DEFAULT_GATEWAY_HOST,
-    DEFAULT_MAX_CHARGE_W,
-    DEFAULT_MAX_DISCHARGE_W,
     DEFAULT_WEATHER_AWARE_SOLAR,
     DOMAIN,
-    PROVIDER_AMBER,
-    PROVIDER_GLOBIRD,
-)
-from .powerwall import (
-    PowerwallAuthError,
-    PowerwallClient,
-    PowerwallError,
-    PowerwallUnreachableError,
-)
-from .pricing.amber import AmberClient
-from .pricing.models import PricingAuthError, PricingError
-
-_LOGGER = logging.getLogger(__name__)
-
-STEP_POWERWALL = vol.Schema(
-    {
-        vol.Required(CONF_GATEWAY_HOST, default=DEFAULT_GATEWAY_HOST): str,
-        vol.Required(CONF_GATEWAY_PASSWORD): str,
-    }
+    PROVIDER_ENTITY_BRIDGE,
+    PROVIDER_FIXED_TARIFF,
 )
 
 STEP_PROVIDER = vol.Schema(
     {
-        vol.Required(CONF_PROVIDER, default=PROVIDER_AMBER): vol.In(
+        vol.Required(CONF_PROVIDER, default=PROVIDER_FIXED_TARIFF): vol.In(
             {
-                PROVIDER_AMBER: "Amber Electric (wholesale)",
-                PROVIDER_GLOBIRD: "GloBird Energy (time-of-use)",
+                PROVIDER_FIXED_TARIFF: "Fixed or time-of-use tariff (enter rates from your bill)",
+                PROVIDER_ENTITY_BRIDGE: "Read prices from an existing integration (e.g. Amber)",
             }
         )
     }
 )
 
-STEP_AMBER = vol.Schema({vol.Required(CONF_AMBER_TOKEN): str})
-
 
 class LibrePowerConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Guided setup."""
+    """Guided setup: pricing only.
+
+    No unique_id enforced - multiple core instances (e.g. separate sites) are
+    allowed; nothing here assumes one LibrePower per Home Assistant install.
+    """
 
     VERSION = 1
 
     def __init__(self) -> None:
         self._data: dict[str, Any] = {}
-        self._amber_sites: list[dict] = []
-        self._reauth_entry: ConfigEntry | None = None
 
     @staticmethod
     @callback
     def async_get_options_flow(entry: ConfigEntry) -> "LibrePowerOptionsFlow":
         return LibrePowerOptionsFlow()
 
-    # -- step 1: Powerwall ----------------------------------------------------
+    # -- step 1: choose pricing source ---------------------------------------
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        errors: dict[str, str] = {}
-
         if user_input is not None:
-            client = PowerwallClient(
-                self.hass,
-                host=user_input[CONF_GATEWAY_HOST],
-                gateway_password=user_input[CONF_GATEWAY_PASSWORD],
-            )
-            try:
-                await client.async_connect()
-            except PowerwallAuthError:
-                errors["base"] = "invalid_gateway_password"
-            except PowerwallUnreachableError:
-                errors["base"] = "gateway_unreachable"
-            except PowerwallError as err:
-                _LOGGER.error("Powerwall setup failed: %s", err)
-                errors["base"] = "unknown"
-            else:
-                await client.async_close()
-                await self.async_set_unique_id(
-                    f"{DOMAIN}_{user_input[CONF_GATEWAY_HOST]}"
-                )
-                self._abort_if_unique_id_configured()
-                self._data.update(user_input)
-                return await self.async_step_provider()
+            self._data.update(user_input)
+            if user_input[CONF_PROVIDER] == PROVIDER_ENTITY_BRIDGE:
+                return await self.async_step_entity_bridge()
+            return await self.async_step_fixed_tariff()
 
-        return self.async_show_form(
-            step_id="user", data_schema=STEP_POWERWALL, errors=errors
-        )
+        return self.async_show_form(step_id="user", data_schema=STEP_PROVIDER)
 
-    # -- reauth: gateway password ---------------------------------------------
+    # -- step 2a: entity bridge ------------------------------------------------
 
-    async def async_step_reauth(
-        self, entry_data: dict[str, Any]
-    ) -> ConfigFlowResult:
-        """Triggered when the Gateway starts rejecting our password."""
-        self._reauth_entry = self.hass.config_entries.async_get_entry(
-            self.context["entry_id"]
-        )
-        return await self.async_step_reauth_confirm()
-
-    async def async_step_reauth_confirm(
+    async def async_step_entity_bridge(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
+        """Point at an existing integration's price sensors.
+
+        Validated out of the box against Amber's official core integration's
+        confirmed attribute shape (see pricing/entity_bridge.py). A different
+        integration's field names, if they differ, can be set afterwards in
+        options — kept out of this first screen so setup for the common case
+        (Amber) stays a two-field pick, not a schema-mapping exercise.
+        """
         errors: dict[str, str] = {}
-        entry = self._reauth_entry
-        assert entry is not None
 
         if user_input is not None:
-            client = PowerwallClient(
-                self.hass,
-                host=entry.data[CONF_GATEWAY_HOST],
-                gateway_password=user_input[CONF_GATEWAY_PASSWORD],
-            )
-            try:
-                await client.async_connect()
-            except PowerwallAuthError:
-                errors["base"] = "invalid_gateway_password"
-            except PowerwallUnreachableError:
-                errors["base"] = "gateway_unreachable"
-            except PowerwallError:
-                errors["base"] = "unknown"
+            # We don't validate connectivity here the way a REST client
+            # would — there's no network call to make. The entities either
+            # exist and have the right shape when the coordinator first reads
+            # them, or they don't; that error surfaces there.
+            import_entity = user_input[CONF_BRIDGE_IMPORT_ENTITY]
+            export_entity = user_input[CONF_BRIDGE_EXPORT_ENTITY]
+            if self.hass.states.get(import_entity) is None:
+                errors["base"] = "entity_not_found"
             else:
-                await client.async_close()
-                # Only the password changes; retailer config is untouched.
-                return self.async_update_reload_and_abort(
-                    entry,
-                    data={**entry.data, **user_input},
-                )
+                self._data[CONF_BRIDGE_IMPORT_ENTITY] = import_entity
+                self._data[CONF_BRIDGE_EXPORT_ENTITY] = export_entity
+                return self._create()
 
         return self.async_show_form(
-            step_id="reauth_confirm",
-            data_schema=vol.Schema({vol.Required(CONF_GATEWAY_PASSWORD): str}),
+            step_id="entity_bridge",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_BRIDGE_IMPORT_ENTITY): selector.EntitySelector(
+                        selector.EntitySelectorConfig(domain="sensor")
+                    ),
+                    vol.Required(CONF_BRIDGE_EXPORT_ENTITY): selector.EntitySelector(
+                        selector.EntitySelectorConfig(domain="sensor")
+                    ),
+                }
+            ),
             errors=errors,
         )
 
-    # -- step 2: choose retailer ---------------------------------------------
+    # -- step 2b: fixed tariff --------------------------------------------------
 
-    async def async_step_provider(
+    async def async_step_fixed_tariff(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        if user_input is not None:
-            self._data.update(user_input)
-            if user_input[CONF_PROVIDER] == PROVIDER_AMBER:
-                return await self.async_step_amber()
-            return await self.async_step_globird()
-
-        return self.async_show_form(step_id="provider", data_schema=STEP_PROVIDER)
-
-    # -- step 3a: Amber -------------------------------------------------------
-
-    async def async_step_amber(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        errors: dict[str, str] = {}
-
-        if user_input is not None:
-            client = AmberClient(
-                async_get_clientsession(self.hass),
-                token=user_input[CONF_AMBER_TOKEN],
-                site_id="",
-            )
-            try:
-                sites = await client.async_get_sites()
-            except PricingAuthError:
-                errors["base"] = "invalid_amber_token"
-            except PricingError as err:
-                _LOGGER.error("Amber lookup failed: %s", err)
-                errors["base"] = "amber_unavailable"
-            else:
-                if not sites:
-                    errors["base"] = "no_amber_sites"
-                else:
-                    self._data[CONF_AMBER_TOKEN] = user_input[CONF_AMBER_TOKEN]
-                    self._amber_sites = sites
-                    if len(sites) == 1:
-                        # Don't make the user pick from a list of one.
-                        self._data[CONF_AMBER_SITE_ID] = sites[0]["id"]
-                        return self._create()
-                    return await self.async_step_amber_site()
-
-        return self.async_show_form(
-            step_id="amber", data_schema=STEP_AMBER, errors=errors
-        )
-
-    async def async_step_amber_site(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        if user_input is not None:
-            self._data[CONF_AMBER_SITE_ID] = user_input[CONF_AMBER_SITE_ID]
-            return self._create()
-
-        choices = {
-            site["id"]: site.get("nmi") or site["id"] for site in self._amber_sites
-        }
-        return self.async_show_form(
-            step_id="amber_site",
-            data_schema=vol.Schema({vol.Required(CONF_AMBER_SITE_ID): vol.In(choices)}),
-        )
-
-    # -- step 3b: GloBird -----------------------------------------------------
-
-    async def async_step_globird(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """GloBird has no price API, so the tariff is entered by hand.
+        """A flat or time-of-use tariff entered by hand, no API involved.
 
         We only collect a flat rate here to keep setup short; peak/offpeak
         windows are configured afterwards in the options flow, where a repeating
@@ -256,7 +138,7 @@ class LibrePowerConfigFlow(ConfigFlow, domain=DOMAIN):
             return self._create()
 
         return self.async_show_form(
-            step_id="globird",
+            step_id="fixed_tariff",
             data_schema=vol.Schema(
                 {
                     vol.Required("default_import_price", default=0.30): vol.Coerce(
@@ -276,9 +158,11 @@ class LibrePowerConfigFlow(ConfigFlow, domain=DOMAIN):
 class LibrePowerOptionsFlow(OptionsFlow):
     """Post-setup tuning.
 
-    Two screens rather than one long form: the handover decision is a different
-    kind of choice from battery limits, and burying "take control of my battery"
-    among capacity fields is how people flip it by accident.
+    No battery-hardware fields here anymore (capacity, max charge/discharge) -
+    those are reported by whichever battery adapter is registered, via
+    ``BatteryClient.async_get_capabilities()``. This screen is only for
+    genuinely site-level policy: control handover, backup reserve, wear cost,
+    and the weather-aware solar toggle.
     """
 
     def __init__(self) -> None:
@@ -295,7 +179,7 @@ class LibrePowerOptionsFlow(OptionsFlow):
             ):
                 # Turning control on for the first time — make it deliberate.
                 return await self.async_step_confirm_control()
-            return await self.async_step_battery()
+            return await self.async_step_tuning()
 
         current = self.config_entry.options
         return self.async_show_form(
@@ -318,48 +202,34 @@ class LibrePowerOptionsFlow(OptionsFlow):
         """Explicit confirmation before LibrePower starts writing to the battery.
 
         Two integrations controlling one battery is the single worst failure
-        mode available here, so this is a stop sign, not a checkbox.
+        mode available here, so this is a stop sign, not a checkbox. Whether
+        a write can actually reach the battery still depends on the battery
+        adapter reading this same setting - see its own README.
         """
         if user_input is not None:
             if not user_input.get("understood"):
                 # Refused — fall back to shadow mode rather than half-enabling.
                 self._options[CONF_CONTROL_ENABLED] = False
-            return await self.async_step_battery()
+            return await self.async_step_tuning()
 
         return self.async_show_form(
             step_id="confirm_control",
             data_schema=vol.Schema({vol.Required("understood", default=False): bool}),
         )
 
-    async def async_step_battery(
+    async def async_step_tuning(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Screen 2: battery limits and optimiser tuning."""
+        """Screen 2: site-level optimiser tuning. No hardware specs here."""
         if user_input is not None:
             self._options.update(user_input)
             return self.async_create_entry(title="", data=self._options)
 
         current = self.config_entry.options
         return self.async_show_form(
-            step_id="battery",
+            step_id="tuning",
             data_schema=vol.Schema(
                 {
-                    vol.Required(
-                        CONF_BATTERY_CAPACITY_WH,
-                        default=current.get(
-                            CONF_BATTERY_CAPACITY_WH, DEFAULT_BATTERY_CAPACITY_WH
-                        ),
-                    ): vol.Coerce(float),
-                    vol.Required(
-                        CONF_MAX_CHARGE_W,
-                        default=current.get(CONF_MAX_CHARGE_W, DEFAULT_MAX_CHARGE_W),
-                    ): vol.Coerce(float),
-                    vol.Required(
-                        CONF_MAX_DISCHARGE_W,
-                        default=current.get(
-                            CONF_MAX_DISCHARGE_W, DEFAULT_MAX_DISCHARGE_W
-                        ),
-                    ): vol.Coerce(float),
                     vol.Required(
                         CONF_BACKUP_RESERVE,
                         default=current.get(

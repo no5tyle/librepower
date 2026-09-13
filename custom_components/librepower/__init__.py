@@ -11,34 +11,25 @@ from datetime import timedelta
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 
+from .battery import BatteryClient
 from .const import (
-    CONF_AMBER_SITE_ID,
-    CONF_CONTROL_ENABLED,
-    CONF_AMBER_TOKEN,
     CONF_BACKUP_RESERVE,
-    CONF_BATTERY_CAPACITY_WH,
+    CONF_BRIDGE_EXPORT_ENTITY,
+    CONF_BRIDGE_IMPORT_ENTITY,
     CONF_CYCLE_COST,
-    CONF_GATEWAY_HOST,
-    CONF_GATEWAY_PASSWORD,
-    CONF_MAX_CHARGE_W,
-    CONF_MAX_DISCHARGE_W,
     CONF_PROVIDER,
     CONF_WEATHER_AWARE_SOLAR,
     DEFAULT_BACKUP_RESERVE,
-    DEFAULT_BATTERY_CAPACITY_WH,
-    DEFAULT_CONTROL_ENABLED,
     DEFAULT_CYCLE_COST,
-    DEFAULT_MAX_CHARGE_W,
-    DEFAULT_MAX_DISCHARGE_W,
     DEFAULT_WEATHER_AWARE_SOLAR,
     DOMAIN,
     OPTIMISE_HORIZON_HOURS,
     OPTIMISE_INTERVAL_MINUTES,
-    PROVIDER_AMBER,
+    PROVIDER_ENTITY_BRIDGE,
+    PROVIDER_FIXED_TARIFF,
     STORAGE_KEY_LOAD_HISTORY,
     STORAGE_KEY_SOLAR_HISTORY,
     STORAGE_SAVE_INTERVAL_MINUTES,
@@ -48,8 +39,6 @@ from .coordinator import LibrePowerCoordinator
 from .load_forecast import LoadForecaster
 from .open_meteo import OpenMeteoClient
 from .optimiser import OptimizationConfig
-from .powerwall import PowerwallAuthError, PowerwallClient, PowerwallError
-from .pricing.amber import AmberClient
 from .solar_forecast import HistoricalSolarForecaster
 from .storage import LearningStore
 
@@ -59,33 +48,20 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up a LibrePower config entry."""
-    # Shadow mode unless explicitly turned on. Safe to run beside another
-    # optimiser: LibrePower reads and plans, but never writes.
-    control_enabled = entry.options.get(
-        CONF_CONTROL_ENABLED, DEFAULT_CONTROL_ENABLED
-    )
-    if not control_enabled:
-        _LOGGER.info(
-            "LibrePower starting in shadow mode - planning only, no battery "
-            "writes. Enable control in options when ready to take over."
-        )
+    """Set up a LibrePower config entry.
 
-    powerwall = PowerwallClient(
-        hass,
-        host=entry.data[CONF_GATEWAY_HOST],
-        gateway_password=entry.data[CONF_GATEWAY_PASSWORD],
-        read_only=not control_enabled,
-    )
+    Since the repo split, core no longer connects to any specific battery
+    here - it has no idea what brand is attached, or whether one is attached
+    yet at all. A separate battery-adapter integration (e.g.
+    ``librepower-powerwall``) does that, then calls
+    ``coordinator.async_set_battery()`` once it has connected. See battery.py
+    and coordinator.py's module docstring for the full contract.
 
-    try:
-        await powerwall.async_connect()
-    except PowerwallAuthError as err:
-        # Gateway password is wrong — prompt reauth rather than retrying forever.
-        raise ConfigEntryAuthFailed(str(err)) from err
-    except PowerwallError as err:
-        raise ConfigEntryNotReady(f"Cannot reach Powerwall: {err}") from err
-
+    This means core's own setup can never fail because a battery isn't
+    reachable - that's the adapter's problem to raise ConfigEntryNotReady
+    over, not core's. Core's entities simply read "waiting" until a battery
+    shows up; sensor.py already handles coordinator.data being sparse.
+    """
     pricing = _build_pricing_client(hass, entry)
 
     latitude = hass.config.latitude
@@ -121,15 +97,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async_get_clientsession(hass), latitude=latitude, longitude=longitude
     )
 
+    # battery_capacity_wh/max_charge_w/max_discharge_w are deliberately not
+    # set here - they use the vendored engine's own placeholder defaults
+    # until a battery registers and coordinator.async_set_battery() applies
+    # its real reported BatteryCapabilities. See battery.py's docstring.
     optimiser_config = OptimizationConfig(
-        battery_capacity_wh=entry.options.get(
-            CONF_BATTERY_CAPACITY_WH,
-            entry.data.get(CONF_BATTERY_CAPACITY_WH, DEFAULT_BATTERY_CAPACITY_WH),
-        ),
-        max_charge_w=entry.options.get(CONF_MAX_CHARGE_W, DEFAULT_MAX_CHARGE_W),
-        max_discharge_w=entry.options.get(
-            CONF_MAX_DISCHARGE_W, DEFAULT_MAX_DISCHARGE_W
-        ),
         backup_reserve=entry.options.get(
             CONF_BACKUP_RESERVE, DEFAULT_BACKUP_RESERVE
         ),
@@ -140,7 +112,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     coordinator = LibrePowerCoordinator(
         hass,
-        powerwall=powerwall,
         pricing=pricing,
         optimiser_config=optimiser_config,
         loads=loads,
@@ -150,9 +121,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         open_meteo=open_meteo,
         weather_aware_solar=weather_aware_solar,
     )
-    await coordinator.async_config_entry_first_refresh()
+    # Not async_config_entry_first_refresh() - that raises ConfigEntryNotReady
+    # on failure, and "no battery has registered yet" is the normal state
+    # right after core is first set up, not a setup failure. async_refresh()
+    # logs and records the failure without raising; sensors read the
+    # resulting "waiting" state until a battery adapter registers.
+    await coordinator.async_refresh()
 
-    # Solve once immediately so entities are populated before the first tick.
+    # Solve once immediately so entities are populated before the first tick,
+    # if a battery is already registered (e.g. HA restarted with the adapter
+    # already configured). A no-op if not - async_refresh_plan bails cleanly
+    # when there's no telemetry yet.
     await coordinator.async_refresh_plan()
 
     entry.async_on_unload(
@@ -185,32 +164,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 def _build_pricing_client(hass: HomeAssistant, entry: ConfigEntry):
-    """Instantiate the configured retailer client.
+    """Instantiate the configured pricing provider.
 
     Deliberately a small factory rather than a plugin registry — with two
     providers, indirection would cost more than it saves.
     """
-    provider = entry.data.get(CONF_PROVIDER, PROVIDER_AMBER)
+    provider = entry.data.get(CONF_PROVIDER, PROVIDER_FIXED_TARIFF)
 
-    if provider == PROVIDER_AMBER:
-        return AmberClient(
-            async_get_clientsession(hass),
-            token=entry.data[CONF_AMBER_TOKEN],
-            site_id=entry.data[CONF_AMBER_SITE_ID],
+    if provider == PROVIDER_ENTITY_BRIDGE:
+        from .pricing.entity_bridge import AMBER_PROFILE, EntityBridgeProvider
+
+        return EntityBridgeProvider(
+            hass,
+            import_entity_id=entry.data[CONF_BRIDGE_IMPORT_ENTITY],
+            export_entity_id=entry.data[CONF_BRIDGE_EXPORT_ENTITY],
+            field_map=AMBER_PROFILE,
         )
 
-    # GloBird is schedule-driven and needs the tariff from options.
-    from .pricing.globird import GlobirdClient, TouSchedule
+    # Fixed tariff is schedule-driven and needs the rates from options.
+    from .pricing.fixed_tariff import FixedTariffProvider
 
     schedule = _schedule_from_options(entry)
-    return GlobirdClient(schedule, dt_util_timezone(hass))
+    return FixedTariffProvider(schedule, dt_util_timezone(hass))
 
 
 def _schedule_from_options(entry: ConfigEntry):
-    """Rebuild a GloBird ToU schedule from stored options."""
+    """Rebuild a fixed-tariff ToU schedule from stored options."""
     from datetime import time
 
-    from .pricing.globird import TouSchedule, TouWindow
+    from .pricing.fixed_tariff import TouSchedule, TouWindow
 
     windows = []
     for raw in entry.options.get("tou_windows", []):
@@ -241,6 +223,36 @@ def dt_util_timezone(hass: HomeAssistant):
     import homeassistant.util.dt as dt_util
 
     return dt_util.DEFAULT_TIME_ZONE
+
+
+async def async_register_battery(
+    hass: HomeAssistant, core_entry_id: str, battery: BatteryClient
+) -> None:
+    """The cross-repo entry point. A battery adapter integration calls this
+    once it has connected, to attach itself to a running core instance.
+
+    Typical caller (in a battery adapter's own __init__.py, e.g.
+    librepower-powerwall), after its own async_connect() succeeds::
+
+        from custom_components.librepower import async_register_battery
+        await async_register_battery(hass, core_entry_id, my_powerwall_client)
+
+    ``core_entry_id`` identifies *which* LibrePower core instance to attach
+    to - the adapter's own config flow is responsible for letting the user
+    pick one if more than one exists (see that repo's config_flow.py).
+
+    Raises KeyError if core_entry_id doesn't correspond to a loaded LibrePower
+    entry - the adapter should treat that as "core isn't set up yet" and
+    surface ConfigEntryNotReady, not something core itself can recover from.
+
+    Not yet handled: what happens if the battery adapter is later removed
+    while core keeps running. Core has no "unregister" path yet - the
+    coordinator just keeps its last-known BatteryClient reference, which will
+    start failing on its next call. Worth revisiting before relying on this
+    for a setup where the battery adapter might be uninstalled independently.
+    """
+    coordinator: LibrePowerCoordinator = hass.data[DOMAIN][core_entry_id]
+    await coordinator.async_set_battery(battery)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
