@@ -35,6 +35,7 @@ from .const import (
     CONF_PROVIDER,
     CONF_MAX_CHARGE_W,
     CONF_MAX_DISCHARGE_W,
+    CONF_WEATHER_AWARE_SOLAR,
     DEFAULT_BACKUP_RESERVE,
     DEFAULT_BATTERY_CAPACITY_WH,
     DEFAULT_CONTROL_ENABLED,
@@ -42,6 +43,7 @@ from .const import (
     DEFAULT_GATEWAY_HOST,
     DEFAULT_MAX_CHARGE_W,
     DEFAULT_MAX_DISCHARGE_W,
+    DEFAULT_WEATHER_AWARE_SOLAR,
     DOMAIN,
     PROVIDER_AMBER,
     PROVIDER_GLOBIRD,
@@ -368,6 +370,12 @@ class LibrePowerOptionsFlow(OptionsFlow):
                         CONF_CYCLE_COST,
                         default=current.get(CONF_CYCLE_COST, DEFAULT_CYCLE_COST),
                     ): vol.All(vol.Coerce(float), vol.Range(min=0.0, max=1.0)),
+                    vol.Required(
+                        CONF_WEATHER_AWARE_SOLAR,
+                        default=current.get(
+                            CONF_WEATHER_AWARE_SOLAR, DEFAULT_WEATHER_AWARE_SOLAR
+                        ),
+                    ): bool,
                 }
             ),
         )

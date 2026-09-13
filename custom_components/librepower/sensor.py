@@ -57,7 +57,10 @@ def _price_now(data: LibrePowerData, export: bool = False) -> float | None:
 def _plan_attrs(data: LibrePowerData) -> dict[str, Any]:
     """Expose the upcoming schedule for dashboard charting."""
     if data.plan is None or not data.plan.success:
-        return {"status": data.last_error or "no plan"}
+        return {
+            "status": data.last_error or "no plan",
+            "solar_forecast_source": data.solar_forecast_source,
+        }
 
     plan = data.plan
     upcoming = []
@@ -77,6 +80,7 @@ def _plan_attrs(data: LibrePowerData) -> dict[str, Any]:
         "interval_minutes": OPTIMISE_INTERVAL_MINUTES,
         "solver": plan.solver_name,
         "solve_time_ms": round(plan.solve_time_ms, 1),
+        "solar_forecast_source": data.solar_forecast_source,
         "total_cost": round(plan.total_cost, 2),
         "baseline_cost": round(plan.baseline_cost, 2),
         "plan_created": data.plan_created.isoformat() if data.plan_created else None,

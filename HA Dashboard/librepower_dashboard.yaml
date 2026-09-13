@@ -172,6 +172,10 @@ views:
             entity: sensor.librepower_planned_action
             attribute: solver
             name: Solver
+          - type: attribute
+            entity: sensor.librepower_planned_action
+            attribute: solar_forecast_source
+            name: Solar forecast source
 
       # -- history --------------------------------------------------------
       - type: history-graph

@@ -75,13 +75,14 @@
       },
       "battery": {
         "title": "Battery and optimiser",
-        "description": "Wear cost charges the optimiser for battery throughput so it won't chase arbitrage that costs more in cell degradation than it earns. Around 0.02 $/kWh is a reasonable starting point for LFP; set 0 to disable.",
+        "description": "Wear cost charges the optimiser for battery throughput so it won't chase arbitrage that costs more in cell degradation than it earns. Around 0.02 $/kWh is a reasonable starting point for LFP; set 0 to disable.\n\nWeather-aware solar forecasting uses Open-Meteo (no account or API key needed) to adjust the history-based solar forecast for tomorrow's actual weather, rather than just typical conditions for the season. Off by default - the history-based forecast works fully offline either way; this only sharpens it. If Open-Meteo is unreachable, the integration silently falls back to history-only.",
         "data": {
           "battery_capacity_wh": "Battery capacity (Wh)",
           "max_charge_w": "Maximum charge power (W)",
           "max_discharge_w": "Maximum discharge power (W)",
           "backup_reserve": "Backup reserve (0-1)",
-          "cycle_cost": "Battery wear cost ($/kWh cycled)"
+          "cycle_cost": "Battery wear cost ($/kWh cycled)",
+          "weather_aware_solar": "Weather-aware solar forecast (Open-Meteo)"
         }
       }
     }

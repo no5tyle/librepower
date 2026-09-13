@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -26,22 +27,31 @@ from .const import (
     CONF_MAX_CHARGE_W,
     CONF_MAX_DISCHARGE_W,
     CONF_PROVIDER,
+    CONF_WEATHER_AWARE_SOLAR,
     DEFAULT_BACKUP_RESERVE,
     DEFAULT_BATTERY_CAPACITY_WH,
     DEFAULT_CONTROL_ENABLED,
     DEFAULT_CYCLE_COST,
     DEFAULT_MAX_CHARGE_W,
     DEFAULT_MAX_DISCHARGE_W,
+    DEFAULT_WEATHER_AWARE_SOLAR,
     DOMAIN,
     OPTIMISE_HORIZON_HOURS,
     OPTIMISE_INTERVAL_MINUTES,
     PROVIDER_AMBER,
+    STORAGE_KEY_LOAD_HISTORY,
+    STORAGE_KEY_SOLAR_HISTORY,
+    STORAGE_SAVE_INTERVAL_MINUTES,
     UPDATE_INTERVAL_OPTIMISE,
 )
 from .coordinator import LibrePowerCoordinator
+from .load_forecast import LoadForecaster
+from .open_meteo import OpenMeteoClient
 from .optimiser import OptimizationConfig
 from .powerwall import PowerwallAuthError, PowerwallClient, PowerwallError
 from .pricing.amber import AmberClient
+from .solar_forecast import HistoricalSolarForecaster
+from .storage import LearningStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +88,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     pricing = _build_pricing_client(hass, entry)
 
+    latitude = hass.config.latitude
+    longitude = hass.config.longitude
+
+    # Learned history: restore from disk if present, start fresh otherwise.
+    # A failed load never blocks startup - see storage.py.
+    load_store = LearningStore(hass, entry.entry_id, STORAGE_KEY_LOAD_HISTORY)
+    solar_store = LearningStore(hass, entry.entry_id, STORAGE_KEY_SOLAR_HISTORY)
+
+    load_data = await load_store.async_load()
+    loads = (
+        LoadForecaster.from_dict(load_data, OPTIMISE_INTERVAL_MINUTES)
+        if load_data
+        else LoadForecaster(OPTIMISE_INTERVAL_MINUTES)
+    )
+
+    solar_data = await solar_store.async_load()
+    solar = (
+        HistoricalSolarForecaster.from_dict(
+            solar_data, latitude, longitude, OPTIMISE_INTERVAL_MINUTES
+        )
+        if solar_data
+        else HistoricalSolarForecaster(latitude, longitude, OPTIMISE_INTERVAL_MINUTES)
+    )
+
+    # Open-Meteo needs no key, but stays opt-in per this project's own rule
+    # that cloud dependencies are never required by default - see const.py.
+    weather_aware_solar = entry.options.get(
+        CONF_WEATHER_AWARE_SOLAR, DEFAULT_WEATHER_AWARE_SOLAR
+    )
+    open_meteo = OpenMeteoClient(
+        async_get_clientsession(hass), latitude=latitude, longitude=longitude
+    )
+
     optimiser_config = OptimizationConfig(
         battery_capacity_wh=entry.options.get(
             CONF_BATTERY_CAPACITY_WH,
@@ -96,7 +139,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     coordinator = LibrePowerCoordinator(
-        hass, powerwall=powerwall, pricing=pricing, optimiser_config=optimiser_config
+        hass,
+        powerwall=powerwall,
+        pricing=pricing,
+        optimiser_config=optimiser_config,
+        loads=loads,
+        solar=solar,
+        latitude=latitude,
+        longitude=longitude,
+        open_meteo=open_meteo,
+        weather_aware_solar=weather_aware_solar,
     )
     await coordinator.async_config_entry_first_refresh()
 
@@ -108,6 +160,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass, coordinator.async_refresh_plan, UPDATE_INTERVAL_OPTIMISE
         )
     )
+
+    async def _async_save_learned_history(_now=None) -> None:
+        # Both learners' to_dict() are cheap, synchronous, in-memory dumps -
+        # safe to call directly from this scheduled callback.
+        await load_store.async_save(coordinator.loads.to_dict())
+        await solar_store.async_save(coordinator.solar.to_dict())
+
+    entry.async_on_unload(
+        async_track_time_interval(
+            hass,
+            _async_save_learned_history,
+            timedelta(minutes=STORAGE_SAVE_INTERVAL_MINUTES),
+        )
+    )
+    # Also flush on unload/restart, not just on the hourly timer - otherwise
+    # up to an hour of learned history is lost on every planned HA restart.
+    entry.async_on_unload(lambda: hass.async_create_task(_async_save_learned_history()))
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

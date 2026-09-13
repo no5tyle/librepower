@@ -32,9 +32,12 @@ from .const import (
     DOMAIN,
     OPTIMISE_HORIZON_HOURS,
     OPTIMISE_INTERVAL_MINUTES,
+    SOLAR_FORECAST_SOURCE_CLIMATOLOGY,
+    SOLAR_FORECAST_SOURCE_OPEN_METEO,
     UPDATE_INTERVAL_TELEMETRY,
 )
 from .load_forecast import LoadForecaster
+from .open_meteo import OpenMeteoClient, OpenMeteoError
 from .optimiser import BatteryOptimiser, OptimizationConfig, OptimizationResult
 from .powerwall import (
     PowerwallClient,
@@ -44,6 +47,8 @@ from .powerwall import (
     PowerwallV1rRequiredError,
 )
 from .pricing import PriceForecast, PricingError, PricingProvider
+from .solar_forecast import HistoricalSolarForecaster
+from .solar_geometry import clear_sky_ghi_estimate
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,6 +66,7 @@ class LibrePowerData:
     current_action: str = ACTION_SELF_CONSUMPTION
     last_error: str | None = None
     control_mode: str = "shadow"
+    solar_forecast_source: str = SOLAR_FORECAST_SOURCE_CLIMATOLOGY
 
     @property
     def has_plan(self) -> bool:
@@ -76,7 +82,12 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
         powerwall: PowerwallClient,
         pricing: PricingProvider,
         optimiser_config: OptimizationConfig,
-        solar_forecaster=None,
+        loads: LoadForecaster,
+        solar: HistoricalSolarForecaster,
+        latitude: float,
+        longitude: float,
+        open_meteo: OpenMeteoClient | None = None,
+        weather_aware_solar: bool = False,
     ) -> None:
         super().__init__(
             hass,
@@ -88,10 +99,29 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
         self._pricing = pricing
         self._optimiser = BatteryOptimiser(optimiser_config)
         self._opt_config = optimiser_config
-        self._solar = solar_forecaster
-        self._loads = LoadForecaster(OPTIMISE_INTERVAL_MINUTES)
+        # Both forecasters are constructed by __init__.py (which restores
+        # persisted state from storage.py before handing them over) rather
+        # than here - this class orchestrates their use, it doesn't own their
+        # lifecycle. See the loads/solar properties below: __init__.py reads
+        # them back out on a save timer via the same objects, not a copy.
+        self._loads = loads
+        self._solar = solar
+        self._lat = latitude
+        self._lon = longitude
+        self._open_meteo = open_meteo
+        self._weather_aware_solar = weather_aware_solar
         self._last_v1r_warning: datetime | None = None
         self.data = LibrePowerData()
+
+    @property
+    def loads(self) -> LoadForecaster:
+        """Exposed so __init__.py can persist learned state on a save timer."""
+        return self._loads
+
+    @property
+    def solar(self) -> HistoricalSolarForecaster:
+        """Exposed so __init__.py can persist learned state on a save timer."""
+        return self._solar
 
     @property
     def _control_mode(self) -> str:
@@ -109,6 +139,7 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
 
         now = datetime.now(timezone.utc)
         self._loads.observe(now, snapshot.load_w)
+        self._solar.observe(now, snapshot.solar_w)
 
         previous = self.data or LibrePowerData()
         return LibrePowerData(
@@ -119,6 +150,7 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
             current_action=self._action_now(previous.plan, previous.plan_created),
             last_error=previous.last_error,
             control_mode=self._control_mode,
+            solar_forecast_source=previous.solar_forecast_source,
         )
 
     # -- slow loop ------------------------------------------------------------
@@ -144,7 +176,7 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
             return
 
         start = prices.start or datetime.now(timezone.utc)
-        solar = await self._async_solar_forecast(start)
+        solar, solar_source = await self._async_solar_forecast(start)
         load = self._loads.forecast(start, SLOT_COUNT)
 
         # The LP is pure CPU and can take ~1s. Never run it on the event loop.
@@ -167,6 +199,7 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
                 current_action=self._action_now(plan, created),
                 last_error=None,
                 control_mode=self._control_mode,
+                solar_forecast_source=solar_source,
             )
         )
 
@@ -267,21 +300,72 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
             config=self._opt_config,
         )
 
-    async def _async_solar_forecast(self, start: datetime) -> list[float]:
-        """Solar forecast in Watts, or zeros if none is configured.
+    async def _async_solar_forecast(
+        self, start: datetime
+    ) -> tuple[list[float], str]:
+        """Solar forecast in Watts, plus which source actually produced it.
 
-        Zeros are the safe default: the optimiser then assumes it must buy all
-        energy, which produces conservative (never over-committed) schedules.
+        The history-based model (self._solar) always runs - it's zero-config,
+        zero-network, and is exactly what should come out when weather-aware
+        mode is off or Open-Meteo is unreachable. When weather-aware mode is
+        on and Open-Meteo succeeds, its forecast GHI is turned into a
+        clearness index (forecast GHI / clear-sky GHI estimate, both using
+        the same crude clear-sky model - see solar_geometry.py for why that
+        consistency is what makes a crude model fine) and passed in as a
+        weather adjustment. The history model still does all the site
+        calibration; Open-Meteo only adjusts for today's actual weather.
         """
-        if self._solar is None:
-            return [0.0] * SLOT_COUNT
-        try:
-            return await self._solar.async_forecast(
-                start, SLOT_COUNT, OPTIMISE_INTERVAL_MINUTES
-            )
-        except Exception as err:  # noqa: BLE001 - forecast is optional
-            _LOGGER.warning("Solar forecast unavailable, assuming none: %s", err)
-            return [0.0] * SLOT_COUNT
+        clearness_index = None
+        source = SOLAR_FORECAST_SOURCE_CLIMATOLOGY
+
+        if self._weather_aware_solar and self._open_meteo is not None:
+            try:
+                ghi_forecast = await self._open_meteo.async_get_ghi_forecast(
+                    OPTIMISE_HORIZON_HOURS
+                )
+                clearness_index = self._build_clearness_index(ghi_forecast, start)
+                source = SOLAR_FORECAST_SOURCE_OPEN_METEO
+            except OpenMeteoError as err:
+                _LOGGER.warning(
+                    "Open-Meteo unavailable, falling back to history-only "
+                    "solar forecast: %s",
+                    err,
+                )
+
+        forecast = self._solar.forecast(start, SLOT_COUNT, clearness_index=clearness_index)
+        return forecast, source
+
+    def _build_clearness_index(
+        self, ghi_forecast: list[tuple[datetime, float]], start: datetime
+    ) -> list[float]:
+        """Map Open-Meteo's hourly GHI onto our slot grid as a clearness ratio.
+
+        Open-Meteo returns hourly points; our slots are OPTIMISE_INTERVAL_MINUTES
+        apart. Same forward-hold approach as PriceForecast.resample: advance to
+        the most recent Open-Meteo hour at or before each slot's timestamp,
+        rather than interpolating - a preceding-hour mean shouldn't be
+        smoothed into something falsely more precise than it is.
+        """
+        if not ghi_forecast:
+            return [1.0] * SLOT_COUNT
+
+        step = timedelta(minutes=OPTIMISE_INTERVAL_MINUTES)
+        result: list[float] = []
+        cursor = 0
+        for i in range(SLOT_COUNT):
+            slot_time = start + step * i
+            while (
+                cursor + 1 < len(ghi_forecast)
+                and ghi_forecast[cursor + 1][0] <= slot_time
+            ):
+                cursor += 1
+            _, ghi = ghi_forecast[cursor]
+            clear_sky = clear_sky_ghi_estimate(slot_time, self._lat, self._lon)
+            if clear_sky <= 0.0:
+                result.append(1.0)  # sun is down; kt is meaningless, forecast will be 0 regardless
+            else:
+                result.append(ghi / clear_sky)
+        return result
 
     # -- plan interpretation --------------------------------------------------
 
@@ -328,6 +412,7 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
                 current_action=current.current_action,
                 last_error=message,
                 control_mode=self._control_mode,
+                solar_forecast_source=current.solar_forecast_source,
             )
         )
 

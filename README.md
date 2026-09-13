@@ -34,7 +34,11 @@ custom_components/librepower/
 ├── coordinator.py        two loops: 30s telemetry, 5min re-solve
 ├── powerwall.py          local TEDAPI via pypowerwall (MIT dependency)
 ├── load_forecast.py      per-slot median of observed load
-├── sensor.py             8 sensors
+├── solar_geometry.py     pure clear-sky elevation/GHI model, no network
+├── solar_forecast.py     history-based solar learner (clear-sky-index)
+├── open_meteo.py         optional weather-aware GHI, no key, opt-in
+├── storage.py            shared persistence for both learners
+├── sensor.py             9 sensors
 ├── optimiser/
 │   ├── engine.py         vendored LP solver (MIT exception, see LICENSE.upstream)
 │   ├── MODIFICATIONS.md  our delta vs upstream — keep current
@@ -109,6 +113,11 @@ This section is the human version — the projects this one actually stands on.
   the local TEDAPI/v1r transport that makes cloud-free Powerwall telemetry
   possible at all. A runtime dependency, not vendored — full credit belongs
   with that project for the actual protocol reverse-engineering.
+- **[Open-Meteo](https://open-meteo.com)** — free, no-key weather forecast
+  data, used optionally to sharpen the solar forecast with actual weather
+  rather than just seasonal climatology. Their generosity (10,000
+  free non-commercial requests/day) is what makes an account-free,
+  low-friction weather-aware mode possible at all.
 - **[PowerSync](https://github.com/bolagnaise/PowerSync)** (bolagnaise) — prior
   art. No code is reused (PolyForm Noncommercial licensed, and LibrePower's
   architecture is intentionally much smaller), but its feature set and its
@@ -214,10 +223,45 @@ Scaffold. Not yet run against real hardware.
 - [ ] Verify `pypowerwall` telemetry field names against a live Gateway
 - [ ] Confirm negative export prices flow correctly through the LP objective
 - [ ] Set a realistic default `cycle_cost` (upstream ships `0.0`)
-- [ ] Solar forecast source (Solcast, or Open-Meteo for a no-key option)
+- [x] Solar forecast source — history-based clear-sky-index model, always on,
+      zero network; Open-Meteo clearness-index adjustment, opt-in, no key
 - [x] Write the plan back to the Gateway (backup-reserve control, active mode)
 - [ ] GloBird ToU windows in the options flow
 - [ ] Tests with a mocked Gateway
+- [ ] Battery efficiency learned from telemetry (next item on the learning
+      roadmap after solar — `charge_efficiency`/`discharge_efficiency` are
+      still a hardcoded 0.90/0.90 in `OptimizationConfig`, never measured)
+- [ ] Load forecast recency weighting (exponential decay toward recent days)
+- [ ] Degradation/`cycle_cost` calibration from observed capacity fade
+
+## Solar forecasting
+
+Two layers, composed by the coordinator — see `solar_forecast.py`,
+`solar_geometry.py`, and `open_meteo.py` for the full design reasoning in
+their docstrings.
+
+**Always on, zero network:** `HistoricalSolarForecaster` learns a per-slot
+"clear-sky index" from the site's own observed production divided by a
+computed clear-sky shape (solar elevation geometry, no API, no key). This
+self-calibrates for panel orientation, tilt, shading, and inverter clipping
+without needing any of those as inputs — it's climatological ("what a
+typical day in this season looks like here"), not a weather forecast.
+
+**Optional, opt-in:** if enabled in options, Open-Meteo's forecast GHI
+(no key, no account, ~10,000 free requests/day) is converted into a
+clearness index — forecast GHI divided by the same clear-sky estimate — and
+multiplied into the history-based forecast as a weather adjustment. Chosen
+over Solcast deliberately: Solcast's free tier now caps new accounts at 10
+API calls/day and requires an account plus a hand-paced polling automation,
+which runs against this project's own low-friction, opt-in-cloud-dependency
+rule. If Open-Meteo is unreachable, this falls back to history-only
+automatically — `sensor.librepower_planned_action`'s `solar_forecast_source`
+attribute reports which one actually produced the current forecast.
+
+Both learners persist across restarts via `storage.py` (HA's `Store` helper),
+saved hourly and on unload — fixing an earlier bug where `LoadForecaster`'s
+`to_dict`/`from_dict` existed but were never actually wired to disk, silently
+losing weeks of learned load history on every restart.
 
 ## Dashboard
 

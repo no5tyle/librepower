@@ -88,3 +88,26 @@ ACTION_CHARGE = "charge"
 ACTION_DISCHARGE = "discharge"
 ACTION_EXPORT = "export"
 ACTION_SELF_CONSUMPTION = "self_consumption"
+
+# --- Solar forecasting --------------------------------------------------
+
+# The history-based clear-sky-index model is always on - zero config, zero
+# network. Open-Meteo is a genuinely optional weather-aware layer on top:
+# default OFF per this project's own rule that cloud dependencies are
+# opt-in, never required, even when (as here) the service needs no API key.
+CONF_WEATHER_AWARE_SOLAR = "weather_aware_solar"
+DEFAULT_WEATHER_AWARE_SOLAR = False
+
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
+SOLAR_FORECAST_SOURCE_CLIMATOLOGY = "climatology"
+SOLAR_FORECAST_SOURCE_OPEN_METEO = "open-meteo"
+
+# --- Learned-history persistence ----------------------------------------
+
+STORAGE_VERSION = 1
+STORAGE_KEY_LOAD_HISTORY = "load_history"
+STORAGE_KEY_SOLAR_HISTORY = "solar_history"
+# How often learned history is flushed to disk. Frequent enough that a crash
+# doesn't lose much; infrequent enough not to be a write-amplification concern.
+STORAGE_SAVE_INTERVAL_MINUTES = 60
