@@ -1,0 +1,7 @@
+# The vendored optimiser engine is third-party code (MIT, powersync-optimiser).
+# linguist-vendored keeps GitHub's language stats from attributing it to this
+# project, and linguist-generated keeps it out of the default diff view so
+# PRs aren't cluttered by a file nobody here wrote line-by-line.
+custom_components/librepower/optimiser/engine.py linguist-vendored
+custom_components/librepower/optimiser/engine.py linguist-generated
+custom_components/librepower/optimiser/LICENSE.upstream linguist-vendored

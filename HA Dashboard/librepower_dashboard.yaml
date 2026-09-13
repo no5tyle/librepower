@@ -1,0 +1,182 @@
+# LibrePower Dashboard
+#
+# One extra HACS frontend card is required: apexcharts-card. That's the whole
+# dependency list — PowerSync's dashboard needs four (button-card, card-mod,
+# power-flow-card-plus, apexcharts-card). Everything else here is a card
+# already built into Home Assistant.
+#
+# Install: HACS -> Frontend -> apexcharts-card
+#
+# Then: Settings -> Dashboards -> Add Dashboard -> New dashboard from scratch
+# -> three-dot menu -> Edit in YAML -> paste this file's content.
+#
+# Entity IDs assume a single LibrePower config entry. With more than one
+# Powerwall configured, HA will suffix duplicates (_2, _3...) and the IDs
+# below will need adjusting to match.
+
+title: LibrePower
+views:
+  - title: Overview
+    path: overview
+    icon: mdi:battery-charging-100
+    cards:
+      # -- status strip -----------------------------------------------------
+      - type: glance
+        title: Status
+        show_state: true
+        show_name: true
+        entities:
+          - entity: sensor.librepower_control_mode
+            name: Control
+            icon: mdi:steering
+          - entity: sensor.librepower_planned_action
+            name: Doing now
+            icon: mdi:battery-sync
+          - entity: sensor.librepower_battery_level
+            name: Battery
+
+      # -- live power flow ----------------------------------------------------
+      - type: horizontal-stack
+        cards:
+          - type: gauge
+            entity: sensor.librepower_battery_level
+            name: Battery
+            min: 0
+            max: 100
+            severity:
+              red: 0
+              yellow: 20
+              green: 40
+          - type: gauge
+            entity: sensor.librepower_solar_power
+            name: Solar
+            min: 0
+            max: 10000
+            severity:
+              green: 0
+          - type: gauge
+            entity: sensor.librepower_home_load
+            name: Load
+            min: 0
+            max: 8000
+            severity:
+              green: 0
+              yellow: 4000
+              red: 6000
+
+      - type: entities
+        title: Power flows
+        entities:
+          - entity: sensor.librepower_battery_power
+            name: Battery (+discharge / -charge)
+          - entity: sensor.librepower_grid_power
+            name: Grid (+import / -export)
+          - entity: sensor.librepower_solar_power
+          - entity: sensor.librepower_home_load
+
+      # -- pricing --------------------------------------------------------
+      - type: horizontal-stack
+        cards:
+          - type: entity
+            entity: sensor.librepower_import_price
+            name: Buying at
+            icon: mdi:transmission-tower-import
+          - type: entity
+            entity: sensor.librepower_export_price
+            name: Selling at
+            icon: mdi:transmission-tower-export
+
+      # -- the plan, as a chart -----------------------------------------
+      # Reads the schedule array published in
+      # sensor.librepower_planned_action's attributes (coordinator.py's
+      # _plan_attrs). Requires apexcharts-card.
+      - type: custom:apexcharts-card
+        header:
+          show: true
+          title: Planned schedule (next 24h)
+        graph_span: 24h
+        span:
+          start: minute
+        yaxis:
+          - id: soc
+            min: 0
+            max: 100
+            decimals: 0
+            apex_config:
+              title:
+                text: SOC %
+          - id: power
+            opposite: true
+            apex_config:
+              title:
+                text: Watts
+        series:
+          - entity: sensor.librepower_planned_action
+            name: Planned SOC
+            yaxis_id: soc
+            type: line
+            data_generator: |
+              const schedule = entity.attributes.schedule || [];
+              const interval = entity.attributes.interval_minutes || 30;
+              const created = entity.attributes.plan_created
+                ? new Date(entity.attributes.plan_created).getTime()
+                : Date.now();
+              return schedule
+                .filter(s => s.soc !== null && s.soc !== undefined)
+                .map(s => [created + s.slot * interval * 60000, s.soc * 100]);
+          - entity: sensor.librepower_planned_action
+            name: Planned charge
+            yaxis_id: power
+            type: column
+            color: '#4caf50'
+            data_generator: |
+              const schedule = entity.attributes.schedule || [];
+              const interval = entity.attributes.interval_minutes || 30;
+              const created = entity.attributes.plan_created
+                ? new Date(entity.attributes.plan_created).getTime()
+                : Date.now();
+              return schedule.map(s => [created + s.slot * interval * 60000, s.charge_w]);
+          - entity: sensor.librepower_planned_action
+            name: Planned discharge
+            yaxis_id: power
+            type: column
+            color: '#f44336'
+            data_generator: |
+              const schedule = entity.attributes.schedule || [];
+              const interval = entity.attributes.interval_minutes || 30;
+              const created = entity.attributes.plan_created
+                ? new Date(entity.attributes.plan_created).getTime()
+                : Date.now();
+              return schedule.map(s => [created + s.slot * interval * 60000, -s.discharge_w]);
+
+      # -- economics ----------------------------------------------------------
+      - type: entities
+        title: This plan's economics
+        entities:
+          - type: attribute
+            entity: sensor.librepower_planned_action
+            attribute: total_cost
+            name: Optimised cost
+            suffix: " $"
+          - type: attribute
+            entity: sensor.librepower_planned_action
+            attribute: baseline_cost
+            name: Baseline cost (no battery action)
+            suffix: " $"
+          - type: attribute
+            entity: sensor.librepower_planned_action
+            attribute: solve_time_ms
+            name: Solve time
+            suffix: " ms"
+          - type: attribute
+            entity: sensor.librepower_planned_action
+            attribute: solver
+            name: Solver
+
+      # -- history --------------------------------------------------------
+      - type: history-graph
+        title: Last 24 hours
+        hours_to_show: 24
+        entities:
+          - sensor.librepower_battery_level
+          - sensor.librepower_import_price

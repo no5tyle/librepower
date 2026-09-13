@@ -1,0 +1,89 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect your Powerwall",
+        "description": "LibrePower talks to the Gateway directly over your local network. You only need the Gateway password printed on the Powerwall itself — no Tesla account required.\n\nYour Home Assistant host must be able to reach the Gateway. If 192.168.91.1 doesn't respond, you may need a static route or to join the Gateway's WiFi network.",
+        "data": {
+          "gateway_host": "Gateway address",
+          "gateway_password": "Gateway password"
+        }
+      },
+      "provider": {
+        "title": "Electricity retailer",
+        "data": {
+          "provider": "Retailer"
+        }
+      },
+      "amber": {
+        "title": "Amber Electric",
+        "description": "Create a token at app.amber.com.au → Settings → API.",
+        "data": {
+          "amber_token": "API token"
+        }
+      },
+      "amber_site": {
+        "title": "Choose your site",
+        "data": {
+          "amber_site_id": "Site"
+        }
+      },
+      "globird": {
+        "title": "GloBird tariff",
+        "description": "GloBird doesn't publish a price API, so enter the rates from your bill in dollars per kWh, GST inclusive. You can add peak and off-peak windows afterwards in the integration options.",
+        "data": {
+          "default_import_price": "Import rate ($/kWh)",
+          "default_export_price": "Feed-in rate ($/kWh)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Powerwall password changed",
+        "description": "The Gateway is no longer accepting the stored password. Re-enter the password printed on the Powerwall.",
+        "data": {
+          "gateway_password": "Gateway password"
+        }
+      }
+    },
+    "error": {
+      "invalid_gateway_password": "The Gateway rejected that password. Check the sticker on the Powerwall — it's the full string, not just the last few characters.",
+      "gateway_unreachable": "Couldn't reach the Gateway at that address. Check that Home Assistant has a network route to it.",
+      "invalid_amber_token": "Amber rejected that API token.",
+      "amber_unavailable": "Couldn't reach the Amber API. Try again shortly.",
+      "no_amber_sites": "That Amber account has no sites on it.",
+      "unknown": "Unexpected error — check the Home Assistant logs."
+    },
+    "abort": {
+      "already_configured": "This Powerwall is already set up.",
+      "reauth_successful": "Reconnected to the Powerwall."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Control",
+        "description": "While this is off, LibrePower runs in shadow mode: it plans a full schedule and publishes it to sensors, but never writes to the battery. That makes it safe to run alongside PowerSync or any other optimiser.",
+        "data": {
+          "control_enabled": "Allow LibrePower to control the battery"
+        }
+      },
+      "confirm_control": {
+        "title": "Hand control to LibrePower?",
+        "description": "Only one integration may control a battery. If PowerSync (or anything else) is still managing this Powerwall, disable its optimiser first and confirm it has stopped writing.\n\nThis also requires v1r pairing (a one-time Fleet API key registration) - the same step PowerSync itself uses for control. Gateway-password-only setup can plan a schedule but cannot write it; enabling control without v1r configured will show 'Control enabled, but v1r pairing is required' on the integration.\n\nTwo optimisers on one battery will fight: each reads the other's change as an error and corrects it, and the battery cycles needlessly.\n\nLeave the box unticked to stay in shadow mode.",
+        "data": {
+          "understood": "No other integration is controlling this Powerwall"
+        }
+      },
+      "battery": {
+        "title": "Battery and optimiser",
+        "description": "Wear cost charges the optimiser for battery throughput so it won't chase arbitrage that costs more in cell degradation than it earns. Around 0.02 $/kWh is a reasonable starting point for LFP; set 0 to disable.",
+        "data": {
+          "battery_capacity_wh": "Battery capacity (Wh)",
+          "max_charge_w": "Maximum charge power (W)",
+          "max_discharge_w": "Maximum discharge power (W)",
+          "backup_reserve": "Backup reserve (0-1)",
+          "cycle_cost": "Battery wear cost ($/kWh cycled)"
+        }
+      }
+    }
+  }
+}

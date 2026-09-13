@@ -1,0 +1,43 @@
+LibrePower
+Copyright (C) 2026 LibrePower contributors
+
+This program is licensed under the GNU General Public License v3.0 or later.
+See LICENSE for the full text.
+
+────────────────────────────────────────────────────────────────────────────
+Third-party component
+────────────────────────────────────────────────────────────────────────────
+
+custom_components/librepower/optimiser/engine.py is vendored from
+powersync-optimiser (Copyright (c) 2024 Ben Boller), licensed under the MIT
+License. The original license text is preserved verbatim in
+custom_components/librepower/optimiser/LICENSE.upstream.
+
+Why this is permitted: MIT is GPL-compatible in one direction. Code under a
+permissive license like MIT can be incorporated into a GPL-licensed work; the
+resulting combined work is distributed under GPL, provided the original MIT
+copyright notice and permission text are preserved for that component — which
+LICENSE.upstream does. MIT does not become GPL by this inclusion: the file's
+original author's MIT grant on their own code is unaffected, and anyone is
+still free to take that specific file and use it under plain MIT terms,
+independent of this repository. It is GPL that governs the combined work
+distributed here — not a relicensing of the vendored file itself.
+
+The reverse direction does not hold: code under GPL cannot be incorporated
+into an MIT-licensed project without the whole combined work becoming GPL.
+
+Local modifications to the vendored file, if any, are tracked in
+custom_components/librepower/optimiser/MODIFICATIONS.md.
+
+────────────────────────────────────────────────────────────────────────────
+Runtime dependencies (not vendored, not modified)
+────────────────────────────────────────────────────────────────────────────
+
+This project depends on, but does not include the source of:
+  - pypowerwall (MIT, Copyright Jason Cox) — local Powerwall TEDAPI transport
+  - cvxpy, highspy, numpy — installed via pip per manifest.json requirements
+
+Depending on permissively-licensed libraries at runtime imposes no GPL
+obligation on those libraries themselves; GPL's copyleft applies to this
+project's own source and to code actually incorporated into it, not to
+libraries invoked through an ordinary dependency mechanism.
