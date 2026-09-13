@@ -351,14 +351,16 @@ actually does, for as long as you want, with no risk of the two fighting.
   poll the same Gateway. The adapter uses a 30s interval; if you see timeouts
   or TEDAPI errors in either integration, widen the telemetry interval in the
   adapter's own `const.py` before blaming the hardware.
-- **Shared dependency: `highspy`.** Both pin it (core needs it for the
-  optimiser), and pip installs one copy into the HA environment. Core pins
-  `>=1.7.0` to match PowerSync's floor so the resolver has no conflict to
-  solve.
-- **`cvxpy` is a heavy install** (pulls SciPy and a compiled solver stack),
-  needed by core. First startup after installing will be slow. This is the
-  main cost of the vendored engine's modelling layer; dropping to raw
-  `highspy` later would remove it.
+- **Core no longer depends on `cvxpy`/`highspy`.** The vendored optimiser
+  originally modelled the LP through `cvxpy` with the `highspy` (HiGHS)
+  backend, but `cvxpy`'s solver stack (`osqp`, `clarabel`, `qdldl`,
+  `sparsediffpy`) publishes no `musllinux` or 32-bit-ARM wheels, and a Home
+  Assistant container has no compiler to build them from source — installs
+  on those hosts failed outright. Core now solves the same LP directly via
+  `scipy.optimize.milp` (HiGHS), which only needs `numpy`/`scipy` and
+  installs cleanly on every platform HA itself supports. If PowerSync still
+  pins `highspy` for its own optimiser, that's independent of core and not a
+  shared-dependency concern anymore.
 - **Only one integration may control the battery.** When you are ready to
   switch, disable PowerSync's optimiser *first*, confirm it has stopped
   writing, then enable control in core's options *and* make sure the battery

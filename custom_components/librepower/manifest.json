@@ -8,9 +8,8 @@
   "issue_tracker": "https://github.com/no5tyle/librepower/issues",
   "requirements": [
     "pypowerwall>=0.14.0",
-    "cvxpy>=1.4.0",
-    "highspy>=1.7.0",
-    "numpy>=1.24.0"
+    "numpy>=1.24.0",
+    "scipy>=1.11.0"
   ],
   "version": "0.1.0"
 }

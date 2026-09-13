@@ -20,9 +20,16 @@ Why this engine and not PowerSync's
 -----------------------------------
 PowerSync's optimiser is PolyForm Noncommercial — fine to fork for personal
 use, unusable for anything distributable. This one is MIT, is ~940 lines
-instead of ~9,300, models degradation cost explicitly via ``cycle_cost``, and
-expresses the LP through cvxpy rather than hand-built constraint matrices.
-Less to understand, more to build on.
+instead of ~9,300, and models degradation cost explicitly via ``cycle_cost``.
+
+It originally expressed the LP through cvxpy rather than hand-built
+constraint matrices - simpler to read and extend. That's since been replaced
+with a hand-built ``scipy.optimize.milp`` (HiGHS) formulation of the same
+problem: cvxpy's default solver stack (osqp, clarabel, qdldl, sparsediffpy)
+publishes no musllinux or 32-bit-ARM wheels, and a Home Assistant container
+has no C/C++/Rust toolchain to build them from source, so it could never
+install on those hosts. scipy has far broader wheel coverage and already
+bundles HiGHS. See MODIFICATIONS.md for the detail.
 """
 from __future__ import annotations
 

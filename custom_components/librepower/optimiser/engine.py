@@ -42,6 +42,16 @@ except ImportError:
     np = None  # type: ignore
     NUMPY_AVAILABLE = False
 
+# Optional dependency - LP solve won't work without it; heuristic fallback covers this case
+try:
+    from scipy import sparse as sp_sparse
+    from scipy.optimize import Bounds, LinearConstraint, milp
+    SCIPY_AVAILABLE = True
+except ImportError:
+    sp_sparse = None  # type: ignore
+    Bounds = LinearConstraint = milp = None  # type: ignore
+    SCIPY_AVAILABLE = False
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -229,10 +239,14 @@ class OptimizationResult:
 
 class BatteryOptimiser:
     """
-    Linear Programming optimiser for battery scheduling.
+    Mixed-integer linear programming optimiser for battery scheduling.
 
-    Uses CVXPY with HiGHS solver to find the optimal charge/discharge schedule
-    that minimizes electricity costs while respecting battery constraints.
+    Uses scipy.optimize.milp (HiGHS backend) to find the optimal charge/
+    discharge schedule that minimizes electricity costs while respecting
+    battery constraints. A binary "mode" variable per interval enforces that
+    grid charging and battery export can never happen in the same interval -
+    modeled exactly via a big-M constraint rather than as a soft penalty (see
+    MODIFICATIONS.md for why this replaced the original cvxpy formulation).
 
     The model explicitly tracks power flows:
     - Solar can go to: load, battery, or grid
@@ -246,22 +260,15 @@ class BatteryOptimiser:
         self._solver_available = self._check_solver()
 
     def _check_solver(self) -> bool:
-        """Check if CVXPY, numpy, and HiGHS solver are available."""
+        """Check if numpy and scipy's HiGHS-backed MILP solver are available."""
         if not NUMPY_AVAILABLE:
             _LOGGER.warning("NumPy not installed - optimization disabled")
             return False
-
-        try:
-            import cvxpy as cp
-            if "HIGHS" in cp.installed_solvers():
-                _LOGGER.info("CVXPY with HiGHS solver available")
-                return True
-            available = cp.installed_solvers()
-            _LOGGER.warning(f"HiGHS not available, using fallback. Available: {available}")
-            return len(available) > 0
-        except ImportError:
-            _LOGGER.warning("CVXPY not installed - optimization disabled")
+        if not SCIPY_AVAILABLE:
+            _LOGGER.warning("SciPy not installed - optimization disabled")
             return False
+        _LOGGER.info("scipy.optimize.milp (HiGHS) available")
+        return True
 
     @property
     def is_available(self) -> bool:
@@ -346,8 +353,8 @@ class BatteryOptimiser:
         cfg: OptimizationConfig,
         n_intervals: int,
     ) -> OptimizationResult:
-        """Solve the LP optimization problem using CVXPY with explicit power flow tracking."""
-        import cvxpy as cp
+        """Solve the LP (as a MILP) using scipy.optimize.milp with explicit power flow tracking."""
+        n = n_intervals
 
         # Convert to numpy arrays
         p_import = np.array(prices_import, dtype=float)
@@ -414,66 +421,40 @@ class BatteryOptimiser:
             max_discharge = 5000.0
 
         # ========================================
-        # DECISION VARIABLES - Explicit power flows
+        # VARIABLE LAYOUT
         # ========================================
+        # Seven continuous power-flow variables per interval, an SOC
+        # trajectory of n+1 continuous variables, and n binary "mode"
+        # variables used only to forbid grid-charging and battery-export
+        # happening in the same interval (see CONSTRAINTS below).
+        O_STL, O_STB, O_STG = 0, n, 2 * n           # Solar → load / battery / grid
+        O_BTL, O_BTG = 3 * n, 4 * n                 # Battery → load (consume) / grid (export)
+        O_GTL, O_GTB = 5 * n, 6 * n                 # Grid → load / battery
+        O_SOC = 7 * n                                # n + 1 variables
+        O_MODE = O_SOC + (n + 1)                     # n variables
+        n_vars = O_MODE + n
 
-        # Solar allocation
-        solar_to_load = cp.Variable(n_intervals, nonneg=True)      # Solar → Home load
-        solar_to_battery = cp.Variable(n_intervals, nonneg=True)   # Solar → Battery charge
-        solar_to_grid = cp.Variable(n_intervals, nonneg=True)      # Solar → Grid export
-
-        # Battery flows
-        battery_to_load = cp.Variable(n_intervals, nonneg=True)    # Battery → Home load (CONSUME)
-        battery_to_grid = cp.Variable(n_intervals, nonneg=True)    # Battery → Grid export (EXPORT)
-
-        # Grid import allocation
-        grid_to_load = cp.Variable(n_intervals, nonneg=True)       # Grid → Home load
-        grid_to_battery = cp.Variable(n_intervals, nonneg=True)    # Grid → Battery charge
-
-        # SOC trajectory
-        soc = cp.Variable(n_intervals + 1)
+        def idx(offset: int, t: int) -> int:
+            return offset + t
 
         # ========================================
-        # DERIVED QUANTITIES
+        # BOUNDS
         # ========================================
+        lb = np.zeros(n_vars)
+        ub = np.full(n_vars, np.inf)
 
-        # Total charge = solar + grid going to battery
-        charge = solar_to_battery + grid_to_battery
+        # Self-consumption mode: only allow grid-to-battery charging when electricity is free/negative
+        # Battery should charge from excess solar, or from grid when price <= 0
+        if cfg.cost_function == CostFunction.SELF_CONSUMPTION:
+            for t in range(n):
+                if p_import[t] > 0:
+                    ub[idx(O_GTB, t)] = 0.0
+                # else: price <= 0, allow charging (it's free or they pay us!)
+            _LOGGER.info("Self-consumption mode: grid charging only when price <= 0")
 
-        # Total discharge = battery going to load + grid
-        discharge = battery_to_load + battery_to_grid
-
-        # Total grid import = grid going to load + battery
-        grid_import = grid_to_load + grid_to_battery
-
-        # Total grid export = solar + battery going to grid
-        grid_export = solar_to_grid + battery_to_grid
-
-        # ========================================
-        # CONSTRAINTS
-        # ========================================
-        constraints = []
-
-        # Solar allocation: all solar must go somewhere
-        for t in range(n_intervals):
-            constraints.append(solar_to_load[t] + solar_to_battery[t] + solar_to_grid[t] == solar[t])
-
-        # Load satisfaction: load must be covered by solar, battery, or grid
-        for t in range(n_intervals):
-            constraints.append(solar_to_load[t] + battery_to_load[t] + grid_to_load[t] == load[t])
-
-        # Initial SOC
-        constraints.append(soc[0] == initial_soc)
-
-        # SOC dynamics
-        for t in range(n_intervals):
-            energy_in = charge[t] * cfg.charge_efficiency * dt_hours
-            energy_out = discharge[t] / cfg.discharge_efficiency * dt_hours
-            delta_soc = (energy_in - energy_out) / capacity_wh
-            constraints.append(soc[t + 1] == soc[t] + delta_soc)
-
-        # SOC bounds
+        # SOC bounds (including gradual recovery ramp, and optional target end SOC)
         min_soc = max(cfg.min_soc, cfg.backup_reserve)
+        lb[idx(O_SOC, 0)] = ub[idx(O_SOC, 0)] = initial_soc
 
         if initial_soc < min_soc:
             # Allow gradual recovery
@@ -482,49 +463,130 @@ class BatteryOptimiser:
             max_energy_per_interval = max_charge * cfg.charge_efficiency * dt_hours
             intervals_to_recover = int(np.ceil(energy_deficit_wh / max_energy_per_interval)) if max_energy_per_interval > 0 else 1
 
-            for t in range(n_intervals + 1):
+            for t in range(1, n + 1):
                 if t <= intervals_to_recover:
                     recovery_progress = t / max(intervals_to_recover, 1)
                     min_soc_at_t = initial_soc + (min_soc - initial_soc) * recovery_progress * 0.8
-                    constraints.append(soc[t] >= min_soc_at_t - 0.02)
+                    lb[idx(O_SOC, t)] = min_soc_at_t - 0.02
                 else:
-                    constraints.append(soc[t] >= min_soc)
-                constraints.append(soc[t] <= cfg.max_soc)
+                    lb[idx(O_SOC, t)] = min_soc
+                ub[idx(O_SOC, t)] = cfg.max_soc
         else:
-            for t in range(n_intervals + 1):
-                constraints.append(soc[t] >= min_soc)
-                constraints.append(soc[t] <= cfg.max_soc)
+            for t in range(1, n + 1):
+                lb[idx(O_SOC, t)] = min_soc
+                ub[idx(O_SOC, t)] = cfg.max_soc
 
         # Target end SOC
         if cfg.target_end_soc is not None:
-            constraints.append(soc[n_intervals] >= cfg.target_end_soc)
+            lb[idx(O_SOC, n)] = max(lb[idx(O_SOC, n)], cfg.target_end_soc)
 
+        # Binary mode variables: 1 = grid-to-battery charging allowed this interval,
+        # 0 = battery export allowed this interval (never both - see CONSTRAINTS).
+        lb[O_MODE:O_MODE + n] = 0.0
+        ub[O_MODE:O_MODE + n] = 1.0
+        integrality = np.zeros(n_vars)
+        integrality[O_MODE:O_MODE + n] = 1
+
+        bounds = Bounds(lb, ub)
+
+        # ========================================
+        # EQUALITY CONSTRAINTS
+        # ========================================
+        eq_rows: list[int] = []
+        eq_cols: list[int] = []
+        eq_vals: list[float] = []
+        eq_rhs: list[float] = []
+
+        def add_eq(row: int, terms: list[tuple[int, float]], rhs: float) -> None:
+            for col, val in terms:
+                eq_rows.append(row)
+                eq_cols.append(col)
+                eq_vals.append(val)
+            eq_rhs.append(rhs)
+
+        row = 0
+        # Solar allocation: all solar must go somewhere
+        for t in range(n):
+            add_eq(row, [(idx(O_STL, t), 1.0), (idx(O_STB, t), 1.0), (idx(O_STG, t), 1.0)], solar[t])
+            row += 1
+
+        # Load satisfaction: load must be covered by solar, battery, or grid
+        for t in range(n):
+            add_eq(row, [(idx(O_STL, t), 1.0), (idx(O_BTL, t), 1.0), (idx(O_GTL, t), 1.0)], load[t])
+            row += 1
+
+        # SOC dynamics
+        charge_coeff = cfg.charge_efficiency * dt_hours / capacity_wh
+        discharge_coeff = dt_hours / (cfg.discharge_efficiency * capacity_wh)
+        for t in range(n):
+            add_eq(row, [
+                (idx(O_SOC, t + 1), 1.0),
+                (idx(O_SOC, t), -1.0),
+                (idx(O_STB, t), -charge_coeff),
+                (idx(O_GTB, t), -charge_coeff),
+                (idx(O_BTL, t), discharge_coeff),
+                (idx(O_BTG, t), discharge_coeff),
+            ], 0.0)
+            row += 1
+
+        A_eq = sp_sparse.csr_matrix((eq_vals, (eq_rows, eq_cols)), shape=(row, n_vars))
+        b_eq = np.array(eq_rhs)
+
+        # ========================================
+        # INEQUALITY CONSTRAINTS (A x <= b)
+        # ========================================
+        ub_rows: list[int] = []
+        ub_cols: list[int] = []
+        ub_vals: list[float] = []
+        ub_rhs: list[float] = []
+
+        def add_ub(row: int, terms: list[tuple[int, float]], rhs: float) -> None:
+            for col, val in terms:
+                ub_rows.append(row)
+                ub_cols.append(col)
+                ub_vals.append(val)
+            ub_rhs.append(rhs)
+
+        row = 0
         # Power limits
-        constraints.append(charge <= max_charge)
-        constraints.append(discharge <= max_discharge)
+        for t in range(n):
+            add_ub(row, [(idx(O_STB, t), 1.0), (idx(O_GTB, t), 1.0)], max_charge)
+            row += 1
+        for t in range(n):
+            add_ub(row, [(idx(O_BTL, t), 1.0), (idx(O_BTG, t), 1.0)], max_discharge)
+            row += 1
 
         # Grid limits
         if cfg.max_grid_import_w is not None:
-            constraints.append(grid_import <= cfg.max_grid_import_w)
+            for t in range(n):
+                add_ub(row, [(idx(O_GTL, t), 1.0), (idx(O_GTB, t), 1.0)], cfg.max_grid_import_w)
+                row += 1
         if cfg.max_grid_export_w is not None:
-            constraints.append(grid_export <= cfg.max_grid_export_w)
-
-        # Self-consumption mode: only allow grid-to-battery charging when electricity is free/negative
-        # Battery should charge from excess solar, or from grid when price <= 0
-        if cfg.cost_function == CostFunction.SELF_CONSUMPTION:
-            for t in range(n_intervals):
-                if p_import[t] > 0:
-                    # Price is positive - don't charge from grid
-                    constraints.append(grid_to_battery[t] == 0)
-                # else: price <= 0, allow charging (it's free or they pay us!)
-            _LOGGER.info("Self-consumption mode: grid charging only when price <= 0")
+            for t in range(n):
+                add_ub(row, [(idx(O_STG, t), 1.0), (idx(O_BTG, t), 1.0)], cfg.max_grid_export_w)
+                row += 1
 
         # CRITICAL: Prevent simultaneous grid charging AND battery export
-        # This is physically wasteful (round-trip losses) and should never happen
-        # We use a "big-M" style constraint to enforce mutual exclusivity
-        # If grid_to_battery > 0, then battery_to_grid must be 0 (and vice versa)
-        # Since we want LP (not MILP), we add a very large penalty instead
-        # This is handled in the objective function below
+        # This is physically wasteful (round-trip losses) and should never happen -
+        # it means buying from grid, storing (losing ~10%), then immediately
+        # discharging to grid (losing another ~10%), which wastes a battery cycle
+        # for no possible net gain. Enforced exactly via a big-M constraint tied to
+        # the binary mode[t] variable (mode[t]=1 permits grid_to_battery,
+        # mode[t]=0 permits battery_to_grid), rather than as a soft penalty - a true
+        # min(a,b) penalty term isn't expressible in a linear objective. See
+        # MODIFICATIONS.md.
+        for t in range(n):
+            add_ub(row, [(idx(O_GTB, t), 1.0), (idx(O_MODE, t), -max_charge)], 0.0)
+            row += 1
+            add_ub(row, [(idx(O_BTG, t), 1.0), (idx(O_MODE, t), max_discharge)], max_discharge)
+            row += 1
+
+        A_ub = sp_sparse.csr_matrix((ub_vals, (ub_rows, ub_cols)), shape=(row, n_vars))
+        b_ub = np.array(ub_rhs)
+        constraints = [
+            LinearConstraint(A_eq, b_eq, b_eq),
+            LinearConstraint(A_ub, -np.inf, b_ub),
+        ]
 
         # ========================================
         # OBJECTIVE FUNCTION
@@ -534,148 +596,124 @@ class BatteryOptimiser:
         LOW_EXPORT_THRESHOLD = 0.05   # Export prices below this are "worthless"
         MIN_WORTHWHILE_EXPORT = 0.10  # Don't export battery unless price > this
 
-        # Cost components (common to all objectives)
-        import_cost = cp.sum(cp.multiply(p_import, grid_import)) * dt_hours / 1000
-        export_revenue = cp.sum(cp.multiply(p_export, grid_export)) * dt_hours / 1000
+        c = np.zeros(n_vars)
 
-        # CRITICAL: Penalty for simultaneous grid charging AND battery export
-        # This should NEVER happen - it means buying from grid, storing (losing 10%),
-        # then immediately discharging to grid (losing another 10%) - always a net loss
-        # unless prices are extremely skewed. Even then, it wastes battery cycles.
-        # We penalize the minimum of grid_to_battery and battery_to_grid to
-        # discourage having both non-zero.
-        # Using element-wise minimum: min(a,b) = 0.5*(a+b - |a-b|) but cvxpy doesn't support abs on variables
-        # Instead, we just add a penalty on both when they're both non-zero
-        # Since we can't detect "both non-zero" in LP, we use a heuristic penalty
-        SIMULTANEOUS_CHARGE_EXPORT_PENALTY = 100.0  # $/kWh penalty
-        simultaneous_penalty = SIMULTANEOUS_CHARGE_EXPORT_PENALTY * cp.sum(
-            cp.minimum(grid_to_battery, battery_to_grid)
-        ) * dt_hours / 1000
+        # Cost components (common to all objectives): import_cost - export_revenue,
+        # where grid_import = grid_to_load + grid_to_battery and
+        # grid_export = solar_to_grid + battery_to_grid.
+        c[O_GTL:O_GTL + n] += p_import * dt_hours / 1000
+        c[O_GTB:O_GTB + n] += p_import * dt_hours / 1000
+        c[O_STG:O_STG + n] -= p_export * dt_hours / 1000
+        c[O_BTG:O_BTG + n] -= p_export * dt_hours / 1000
 
         if cfg.cost_function == CostFunction.COST_MINIMIZATION:
             # Minimize electricity cost
             # Penalize battery_to_grid (export from battery) when prices are low
             # This is the key insight: consuming battery to cover load is FINE,
             # but exporting battery at low prices is WASTEFUL
-            battery_export_penalty_weights = np.where(p_export <= LOW_EXPORT_THRESHOLD, 5.0, 0)
-            battery_export_penalty = cp.sum(cp.multiply(battery_export_penalty_weights, battery_to_grid)) * dt_hours / 1000
+            battery_export_penalty = np.where(p_export <= LOW_EXPORT_THRESHOLD, 5.0, 0.0)
+            c[O_BTG:O_BTG + n] += battery_export_penalty * dt_hours / 1000
 
             # Also penalize solar export at very low prices (opportunity cost)
-            solar_export_penalty_weights = np.where(p_export < MIN_WORTHWHILE_EXPORT, 0.5, 0)
-            solar_export_penalty = cp.sum(cp.multiply(solar_export_penalty_weights, solar_to_grid)) * dt_hours / 1000
+            solar_export_penalty = np.where(p_export < MIN_WORTHWHILE_EXPORT, 0.5, 0.0)
+            c[O_STG:O_STG + n] += solar_export_penalty * dt_hours / 1000
 
             # Penalize grid_to_battery when import prices are high
             avg_import = np.mean(p_import)
-            high_price_charge_penalty = np.where(p_import > avg_import * 1.2, 0.5, 0)
-            expensive_charge_penalty = cp.sum(cp.multiply(high_price_charge_penalty, grid_to_battery)) * dt_hours / 1000
-
-            objective = cp.Minimize(
-                import_cost - export_revenue +
-                battery_export_penalty + solar_export_penalty + expensive_charge_penalty +
-                simultaneous_penalty
-            )
+            expensive_charge_penalty = np.where(p_import > avg_import * 1.2, 0.5, 0.0)
+            c[O_GTB:O_GTB + n] += expensive_charge_penalty * dt_hours / 1000
 
         elif cfg.cost_function == CostFunction.PROFIT_MAXIMIZATION:
             # Maximize profit from grid trading
             # Key: ONLY export battery when prices are good
             # battery_to_load (consume) has NO penalty - using battery to avoid import is fine
             # battery_to_grid (export) should only happen at good prices
-
-            battery_export_penalty_weights = np.where(p_export <= LOW_EXPORT_THRESHOLD, 10.0, 0)
-            battery_export_penalty = cp.sum(cp.multiply(battery_export_penalty_weights, battery_to_grid)) * dt_hours / 1000
+            battery_export_penalty = np.where(p_export <= LOW_EXPORT_THRESHOLD, 10.0, 0.0)
+            c[O_BTG:O_BTG + n] += battery_export_penalty * dt_hours / 1000
 
             # Small penalty for solar export at very low prices
-            solar_export_penalty_weights = np.where(p_export < MIN_WORTHWHILE_EXPORT, 1.0, 0)
-            solar_export_penalty = cp.sum(cp.multiply(solar_export_penalty_weights, solar_to_grid)) * dt_hours / 1000
-
-            objective = cp.Minimize(
-                import_cost - export_revenue +
-                battery_export_penalty + solar_export_penalty +
-                simultaneous_penalty
-            )
+            solar_export_penalty = np.where(p_export < MIN_WORTHWHILE_EXPORT, 1.0, 0.0)
+            c[O_STG:O_STG + n] += solar_export_penalty * dt_hours / 1000
 
         else:  # SELF_CONSUMPTION
             # Maximize solar self-consumption
             # Priority: use solar for load, then store in battery, then export
             # Never export battery at low prices
-
             FREE_THRESHOLD = 0.01
 
             # Penalize grid imports when electricity costs money
-            import_penalty_weights = np.where(p_import <= FREE_THRESHOLD, 0, 50)
-            import_penalty = cp.sum(cp.multiply(import_penalty_weights, grid_import)) * dt_hours / 1000
+            import_penalty = np.where(p_import <= FREE_THRESHOLD, 0.0, 50.0)
+            c[O_GTL:O_GTL + n] += import_penalty * dt_hours / 1000
+            c[O_GTB:O_GTB + n] += import_penalty * dt_hours / 1000
 
             # Incentivize charging during free periods
-            charge_incentive_weights = np.where(p_import <= FREE_THRESHOLD, 0.1, 0)
-            charge_incentive = cp.sum(cp.multiply(charge_incentive_weights, grid_to_battery)) * dt_hours / 1000
+            charge_incentive = np.where(p_import <= FREE_THRESHOLD, 0.1, 0.0)
+            c[O_GTB:O_GTB + n] -= charge_incentive * dt_hours / 1000
 
             # Heavy penalty for battery export at low prices
-            battery_export_penalty_weights = np.where(p_export <= LOW_EXPORT_THRESHOLD, 100, 0)
-            battery_export_penalty = cp.sum(cp.multiply(battery_export_penalty_weights, battery_to_grid)) * dt_hours / 1000
+            battery_export_penalty = np.where(p_export <= LOW_EXPORT_THRESHOLD, 100.0, 0.0)
+            c[O_BTG:O_BTG + n] += battery_export_penalty * dt_hours / 1000
 
             # Light penalty for solar export (prefer self-consumption)
-            solar_export_penalty = cp.sum(solar_to_grid) * dt_hours / 1000 * 0.1
-
-            objective = cp.Minimize(
-                import_penalty + battery_export_penalty + solar_export_penalty +
-                import_cost - charge_incentive + simultaneous_penalty
-            )
+            c[O_STG:O_STG + n] += 0.1 * dt_hours / 1000
 
         # Cycle cost
         if cfg.cycle_cost > 0:
-            cycle_penalty = cfg.cycle_cost * cp.sum(charge + discharge) * dt_hours / 1000
-            objective = cp.Minimize(objective.args[0] + cycle_penalty)
+            cycle_coeff = cfg.cycle_cost * dt_hours / 1000
+            c[O_STB:O_STB + n] += cycle_coeff
+            c[O_GTB:O_GTB + n] += cycle_coeff
+            c[O_BTL:O_BTL + n] += cycle_coeff
+            c[O_BTG:O_BTG + n] += cycle_coeff
 
         # ========================================
         # SOLVE
         # ========================================
-        problem = cp.Problem(objective, constraints)
         SOLVER_TIMEOUT = 30
+        solver_name = "HiGHS (MILP)"
 
-        solver_name = "HIGHS"
-        try:
-            if "HIGHS" in cp.installed_solvers():
-                problem.solve(solver=cp.HIGHS, verbose=False, time_limit=SOLVER_TIMEOUT)
-            else:
-                problem.solve(verbose=False, solver_opts={"time_limit": SOLVER_TIMEOUT})
-                solver_name = "default"
-        except Exception as e:
-            _LOGGER.warning(f"Primary solver failed: {e}, trying fallback")
-            problem.solve(verbose=False)
-            solver_name = "fallback"
-
-        if problem.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            _LOGGER.warning(f"Optimization failed with status: {problem.status}")
-            return OptimizationResult(
-                success=False,
-                status=f"Solver status: {problem.status}",
-                solver_name=solver_name,
-            )
+        result = milp(
+            c,
+            constraints=constraints,
+            integrality=integrality,
+            bounds=bounds,
+            options={"time_limit": SOLVER_TIMEOUT, "disp": False},
+        )
 
         # ========================================
         # EXTRACT RESULTS
         # ========================================
 
-        # Check for None values (solver didn't find solution)
-        if solar_to_load.value is None or battery_to_load.value is None:
-            _LOGGER.error("Solver returned None values - optimization failed")
+        # Check for a solution (infeasible/unbounded/no incumbent found in time)
+        if result.x is None:
+            _LOGGER.warning(f"Optimization failed with status: {result.status} ({result.message})")
             return OptimizationResult(
                 success=False,
-                status="Solver returned no solution",
+                status=f"Solver status: {result.message}",
                 solver_name=solver_name,
             )
 
-        # Detailed flow results
-        solar_to_load_vals = np.maximum(solar_to_load.value, 0).tolist()
-        solar_to_battery_vals = np.maximum(solar_to_battery.value, 0).tolist()
-        solar_to_grid_vals = np.maximum(solar_to_grid.value, 0).tolist()
-        battery_to_load_vals = np.maximum(battery_to_load.value, 0).tolist()
-        battery_to_grid_vals = np.maximum(battery_to_grid.value, 0).tolist()
-        grid_to_load_vals = np.maximum(grid_to_load.value, 0).tolist()
-        grid_to_battery_vals = np.maximum(grid_to_battery.value, 0).tolist()
+        if not result.success:
+            # A feasible (but not proven-optimal) incumbent was found before the
+            # time limit - still useful, just log it.
+            _LOGGER.warning(
+                f"Optimization did not reach proven optimality (status={result.status}: "
+                f"{result.message}); using best solution found"
+            )
 
-        # SANITY CHECK: Detect impossible simultaneous grid charge and battery export
-        # If both happen at same interval, zero out the smaller one
+        x = result.x
+
+        # Detailed flow results
+        solar_to_load_vals = np.maximum(x[O_STL:O_STL + n], 0).tolist()
+        solar_to_battery_vals = np.maximum(x[O_STB:O_STB + n], 0).tolist()
+        solar_to_grid_vals = np.maximum(x[O_STG:O_STG + n], 0).tolist()
+        battery_to_load_vals = np.maximum(x[O_BTL:O_BTL + n], 0).tolist()
+        battery_to_grid_vals = np.maximum(x[O_BTG:O_BTG + n], 0).tolist()
+        grid_to_load_vals = np.maximum(x[O_GTL:O_GTL + n], 0).tolist()
+        grid_to_battery_vals = np.maximum(x[O_GTB:O_GTB + n], 0).tolist()
+
+        # SANITY CHECK: the mode[t] constraint makes simultaneous grid charge and
+        # battery export structurally infeasible, but MILP solves have finite
+        # numerical tolerance - guard against floating-point leakage anyway.
         for t in range(n_intervals):
             gtb = grid_to_battery_vals[t]
             btg = battery_to_grid_vals[t]
@@ -694,7 +732,7 @@ class BatteryOptimiser:
         discharge_w = [l + g for l, g in zip(battery_to_load_vals, battery_to_grid_vals)]
         import_w = [l + b for l, b in zip(grid_to_load_vals, grid_to_battery_vals)]
         export_w = [s + b for s, b in zip(solar_to_grid_vals, battery_to_grid_vals)]
-        soc_values = np.clip(soc.value, 0, 1).tolist()
+        soc_values = np.clip(x[O_SOC:O_SOC + n + 1], 0, 1).tolist()
 
         timestamps = [
             start_time + timedelta(minutes=cfg.interval_minutes * i)
@@ -727,7 +765,7 @@ class BatteryOptimiser:
 
         return OptimizationResult(
             success=True,
-            status="optimal",
+            status="optimal" if result.status == 0 else f"optimal (solver status: {result.message})",
             # Legacy fields
             charge_schedule_w=charge_w,
             discharge_schedule_w=discharge_w,

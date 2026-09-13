@@ -8,7 +8,10 @@ upstream, and it's what makes pulling upstream fixes back in feasible.
 
 ## Applied
 
-_None yet — `engine.py` is currently a verbatim copy._
+| # | Change | Why |
+|---|--------|-----|
+| 1 | Replaced the cvxpy/HiGHS LP formulation with a hand-built `scipy.optimize.milp` (HiGHS) formulation of the same problem — same decision variables, same constraints, same objective. | cvxpy's default solver stack (`osqp`, `clarabel`, `qdldl`, `sparsediffpy`) is an unconditional dependency of the `cvxpy` package, publishes no `musllinux` or 32-bit-ARM wheels, and a Home Assistant container ships no C/C++/Rust toolchain to build them from source. Installing librepower on a musl-libc host (Alpine-based HA image, confirmed via `platform.libc_ver()`) failed with an unrecoverable `RequirementsNotFound: cvxpy`, blocking config flow entirely even though `engine.py` already had a working heuristic fallback for when no solver is available. `scipy` has far broader wheel coverage (including `musllinux`) and already bundles HiGHS, so dropping cvxpy as the modeling layer removes the whole problem. Upstream (`bolagnaise/powersync-optimiser`) is archived, so there's no ongoing upstream to diverge from — this is a permanent fork, not a tracked delta. |
+| 2 | Replaced the soft "simultaneous grid-charge/battery-export" penalty (`SIMULTANEOUS_CHARGE_EXPORT_PENALTY * cp.sum(cp.minimum(grid_to_battery, battery_to_grid))`) with an exact big-M constraint on a binary `mode[t]` variable per interval. | `cp.minimum()` of two affine expressions is concave, so adding it as a positive term inside a `cp.Minimize` objective isn't actually DCP-valid — the original comment admits it's "a heuristic penalty" chosen only because "we can't detect 'both non-zero' in LP." Since the rewrite already needed a solver capable of integer variables (`scipy.optimize.milp`), a binary `mode[t]` per interval enforces the exclusion exactly instead of approximately, with no penalty tuning required. |
 
 ## Planned
 
