@@ -34,6 +34,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .battery import (
+    BatteryAlreadyRegisteredError,
     BatteryClient,
     BatteryControlUnavailableError,
     BatteryError,
@@ -143,6 +144,11 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
     async def async_set_battery(self, battery: BatteryClient) -> None:
         """Called by a battery adapter integration once it has connected.
 
+        Raises BatteryAlreadyRegisteredError on a second call - see
+        battery.py's docstring on why multiple physical batteries per core
+        entry isn't supported yet, and why this is a loud failure rather
+        than silently discarding the first registration.
+
         Fetches the adapter's reported physical capabilities (capacity, max
         charge/discharge) and applies them to the optimiser config - these
         are properties of the specific battery hardware, not something core
@@ -150,6 +156,13 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
         docstring for why this is user-entered in the adapter, not
         auto-detected from the device.
         """
+        if self._battery is not None:
+            raise BatteryAlreadyRegisteredError(
+                "A battery is already registered with this LibrePower "
+                "instance. Multiple batteries per core entry are not yet "
+                "supported - use a separate LibrePower core instance per "
+                "battery for now."
+            )
         self._battery = battery
         try:
             caps = await battery.async_get_capabilities()
@@ -163,6 +176,8 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
             self._opt_config.battery_capacity_wh = caps.capacity_wh
             self._opt_config.max_charge_w = caps.max_charge_w
             self._opt_config.max_discharge_w = caps.max_discharge_w
+            self._opt_config.charge_efficiency = caps.charge_efficiency
+            self._opt_config.discharge_efficiency = caps.discharge_efficiency
         # Kick the fast loop immediately rather than waiting up to 30s for
         # the next scheduled tick - the person just finished setup and
         # entities should populate right away.
@@ -291,18 +306,19 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
         created: datetime,
         snapshot: BatterySnapshot,
     ) -> None:
-        """Translate the current plan slot into the one lever we pull.
+        """Translate the current plan slot into a disposition command.
 
-        Backup reserve is deliberately the only control surface this calls:
-          - reserve above current SOC  -> holds / charges toward it
-          - reserve at the floor       -> permits discharge for load and export
-        This can't express every nuance the LP computed (it doesn't itself
-        command a charge *rate*), but every ``BatteryClient`` is required to
-        support it (see battery.py) precisely because it's the one write that
-        tends to survive across firmware/brand differences - PowerSync uses
-        the same lever on Powerwall for the same reason. An adapter is free
-        to do something smarter internally on top of the reserve target if
-        its hardware supports it; core only ever asks for this one thing.
+        Every adapter is required to support async_charge/discharge/hold/
+        release, each taking a target SOC where relevant (see battery.py's
+        docstring for why a target, not a bare direction) - core decides
+        *what* it wants, the adapter decides *how* to achieve it on its own
+        hardware (e.g. Powerwall's async_charge pads the reserve above
+        current SOC internally to force grid charge; core doesn't need to
+        know that's how Powerwall does it).
+
+        Export policy (curtail_export/allow_export) is a separate channel -
+        not called from here yet. The LP has no curtailment signal of its
+        own to drive it; see optimiser/MODIFICATIONS.md item 6.
         """
         index = self._slot_index(created)
         if index is None:
@@ -317,17 +333,18 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
 
         target_soc = plan.soc_trajectory[target_index]
 
-        if action in (ACTION_CHARGE,):
-            # Hold above current SOC so the battery is *forced* to take grid
-            # charge rather than merely being allowed to.
-            reserve = max(target_soc, snapshot.soc)
-        elif action in (ACTION_DISCHARGE, ACTION_EXPORT, ACTION_SELF_CONSUMPTION):
-            # Release down to the LP's planned floor for this slot.
-            reserve = target_soc
+        if action == ACTION_CHARGE:
+            await self._battery.async_charge(target_soc)
+        elif action in (ACTION_DISCHARGE, ACTION_EXPORT):
+            await self._battery.async_discharge(target_soc)
+        elif action == ACTION_SELF_CONSUMPTION:
+            # Not "discharge toward a target" - self-consumption means don't
+            # actively hold or force anything, let the battery serve load
+            # naturally. release() is the correct signal for that, distinct
+            # from hold(): hold pins a level, release stops overriding.
+            await self._battery.async_release()
         else:  # ACTION_IDLE
-            reserve = snapshot.soc
-
-        await self._battery.async_set_backup_reserve(reserve)
+            await self._battery.async_hold(snapshot.soc)
 
     def _slot_index(self, created: datetime) -> int | None:
         if created is None:

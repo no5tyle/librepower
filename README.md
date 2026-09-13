@@ -79,31 +79,158 @@ custom_components/librepower/
                           maintaining its own retailer API clients
 ```
 
-### How battery adapters connect
+### Battery adapter interface
 
-`librepower-powerwall` (or any future brand's adapter) declares
-`"dependencies": ["librepower"]` in its own manifest, guaranteeing core loads
-first, then imports `battery.py`'s types directly via Home Assistant's shared
-`custom_components` namespace package and calls
-`async_register_battery(hass, core_entry_id, client)`. Until an adapter
-registers, core's sensors read `"waiting"` — that's the normal state right
-after core is first set up, not an error.
+This is the published contract — everything a new battery-brand adapter
+needs to implement is documented here and in `battery.py`'s own docstring
+(same content, that's the source of truth if the two ever drift). Building
+support for a new brand means writing an adapter repo that implements this
+and nothing else; core never needs to change.
 
-Battery-physical specs (capacity, max charge/discharge) are reported by
-whichever adapter registers, via `BatteryClient.async_get_capabilities()` —
-not typed into core's own options. A Sigenergy install and a Powerwall
-install have different numbers; asking for them in core, disconnected from
-which battery is actually attached, was the wrong place for that config to
-live. See `battery.py`'s docstring for why this is adapter-entered rather
-than auto-detected (checked: pypowerwall has no nameplate-capacity API).
+**How to connect:** declare `"dependencies": ["librepower"]` in your
+manifest — this guarantees core loads first. Then, from your adapter's own
+`async_setup_entry`, import core's types via Home Assistant's shared
+`custom_components` namespace package and register:
 
-Everything about *how* a specific battery connects — local vs cloud
-transport, what control actually requires, curtailment mechanisms, and so on
-— now lives in that battery's own adapter repo, since core has no
-brand-specific knowledge at all. For Powerwall specifically, see
-[librepower-powerwall's README](https://github.com/YOURNAME/librepower-powerwall)
-for the full detail on gateway-password telemetry vs the v1r requirement for
-control, and the two curtailment mechanisms Tesla's Gateway supports.
+```python
+from custom_components.librepower.battery import BatteryClient, BatterySnapshot, ...
+from custom_components.librepower import async_register_battery
+
+await async_register_battery(hass, core_entry_id, my_client)
+```
+
+Until an adapter registers, core's sensors read `"waiting"` — that's the
+normal state right after core is first set up, not an error. Only one
+battery may be registered per core entry; a second attempt raises
+`BatteryAlreadyRegisteredError` rather than silently replacing the first
+(see "One battery per core entry" below).
+
+#### Commands core sends (two independent channels)
+
+**Battery disposition** — mutually exclusive, one active at a time:
+
+| Method | Meaning |
+|---|---|
+| `async_charge(target_soc: float)` | Charge toward this SOC (0-1), forcing grid charge if your hardware needs that distinction from merely permitting it |
+| `async_discharge(target_soc: float)` | Permit discharge down to this SOC, for load and/or export |
+| `async_hold(soc: float)` | Pin at this SOC — no charge, no discharge |
+| `async_release()` | Stop overriding. Return to the battery's own native automatic behaviour. Distinct from `hold`: hold pins a level, release lets go entirely — the correct signal for a clean handoff when LibrePower is disabled |
+
+All three of charge/discharge/hold take a **target**, not a bare direction —
+core's optimiser runs a real linear program to work out *how much*; a
+directionless signal would throw that away and likely push every adapter
+toward reinventing its own "how much is enough" logic. The real limitation
+this doesn't solve: a single target per re-solve cycle can't express
+*pacing* (gently over three hours vs. immediately at max rate) — accepted,
+not fixed.
+
+**Export policy** — independent of disposition, because they compose (e.g.
+charging the battery *and* curtailing export simultaneously, to soak up
+excess solar during a negative-price event without any of it reaching the
+grid, is a real scenario a single combined enum can't express):
+
+| Method | Meaning |
+|---|---|
+| `async_curtail_export(level: "soft" \| "strong")` | Reduce or block export. Named by *effect*, not mechanism — deliberately not Tesla's own `battery_ok/pv_only/never` vocabulary, since that doesn't map cleanly onto every brand's actual export-control primitive |
+| `async_allow_export()` | Normal operation, no export restriction |
+
+"Soft" should mean "stay grid-connected, just don't export" — however your
+hardware achieves that. "Strong" means "block by any means necessary,"
+including full islanding if that's genuinely what it takes. What either one
+means mechanically is entirely up to your adapter.
+
+#### Data core reads
+
+```python
+@dataclass
+class BatterySnapshot:
+    soc: float                        # 0.0-1.0
+    solar_w: float                    # >= 0
+    battery_w: float                  # + discharging, - charging
+    grid_w: float                     # + importing, - exporting
+    load_w: float                     # >= 0
+    timestamp: datetime               # tz-aware; when this reading was taken
+    grid_connected: bool = True       # verifies strong curtailment actually islanded
+    operational_status: str = "ok"    # "ok" is the only value core treats specially;
+                                       # report anything else as-is for faults/updates/etc
+    state_of_health: float | None     # 0.0-1.0 degradation, None if your hardware can't report it
+```
+
+```python
+@dataclass
+class BatteryCapabilities:
+    capacity_wh: float
+    max_charge_w: float
+    max_discharge_w: float
+    charge_efficiency: float = 0.90     # pre-measurement default, see below
+    discharge_efficiency: float = 0.90
+```
+
+Fetched once at registration and applied directly to the optimiser's config
+— **not** typed into core's own setup. Capacity, charge/discharge limits,
+and efficiency are properties of your specific battery; asking for them in
+core, disconnected from which battery is actually attached, was the wrong
+place for that config to live. Most local battery protocols (pypowerwall
+included, confirmed by checking) have no way to read nameplate capacity from
+the device — expect to collect these from the user during your own adapter's
+setup, not auto-detect them.
+
+Efficiency specifically is a **pre-measurement default, not a promise** — a
+manufacturer nameplate figure, better than one number assumed for every
+brand, but still static. A future telemetry-based learning feature is
+expected to supersede this once enough real charge/discharge history exists;
+how a learned value and an adapter-reported default reconcile isn't decided
+yet.
+
+#### Exceptions
+
+All inherit from `BatteryError`. Raise the most specific one that applies —
+core's coordinator catches the generic types and doesn't need to know which
+brand or which specific cause is behind them:
+
+| Exception | When |
+|---|---|
+| `BatteryAuthError` | Credentials rejected |
+| `BatteryUnreachableError` | Can't contact the battery at all |
+| `BatteryReadOnlyError` | A write was attempted in shadow mode — raise this yourself from every command method if `read_only` is set; core relies on the adapter enforcing this at the lowest level, not on a higher-level guard |
+| `BatteryControlUnavailableError` | Control is enabled but you can't currently write, for whatever brand-specific reason (subclass this with your own more specific type — see `PowerwallV1rRequiredError` for the pattern) |
+| `BatteryAlreadyRegisteredError` | Raised by core itself, not something an adapter raises |
+
+#### One battery per core entry
+
+Multiple *brands* (one repo each) is exactly what this split exists for.
+Multiple *physical batteries combined under one site* is a different, harder
+feature — real (Tesla sells multi-Powerwall systems) but out of scope until
+a single battery is confirmed working end to end on real hardware. Two
+independent core entries are today's workaround for two independently
+managed batteries.
+
+#### The cross-repo import mechanism, and its honest limitation
+
+Home Assistant loads every custom_component under a shared
+`custom_components` namespace package, so the import above works in
+practice, and manifest `dependencies` guarantees load order. This is an
+established community pattern, but it is **not an HA-core-blessed stable
+API** — it relies on `custom_components` being importable-by-path, true
+today but not a documented guarantee. Worth re-verifying if a future HA
+release changes integration loading.
+
+**Verified** (constructed `custom_components` namespace-package sandbox with
+a minimal `homeassistant` stub, exercising the real cross-repo import path —
+not an isolated test double): `PowerwallClient` genuinely satisfies
+`BatteryClient` via `isinstance()`; every one of the six command methods is
+correctly blocked in shadow mode and correctly maps to its Powerwall
+mechanism (charge forces reserve above current SOC; discharge/hold set
+reserve directly; release sets self-consumption mode; soft/strong
+curtailment map to export-rule and islanding respectively); adapter-specific
+exceptions are caught as core's generic types; capabilities including
+efficiency propagate into the optimiser config on registration; a second
+registration attempt is rejected rather than silently discarding the first.
+
+**Not yet verified: an actual live two-integration Home Assistant install.**
+The sandbox confirms the import graph and every documented behaviour is
+sound — it does not confirm HA's real config-entry lifecycle, options-reload
+timing, or storage behave as expected end to end.
 
 ### How pricing works
 
@@ -259,10 +386,14 @@ the option.
 
 **What "active" actually does:** on each 5-minute re-solve, the coordinator
 reads the LP's target SOC for the current slot and calls the registered
-battery's `async_set_backup_reserve()` — raised above current SOC to force a
-charge, lowered to the plan's floor to permit discharge. That's the one
-lever pulled; the LP's richer output (planned charge/discharge *rate*,
-specifically) isn't commanded, only used to decide direction.
+battery's `async_charge()`, `async_discharge()`, `async_hold()`, or
+`async_release()` depending on the plan's current action — see "Battery
+adapter interface" above for what each means and why they take a target SOC
+rather than a bare direction. That's the disposition channel; the LP's
+richer output (planned charge/discharge *rate*, specifically) isn't
+commanded, only used to decide direction and target. The export-policy
+channel (curtailment) isn't driven by the coordinator yet — the LP has no
+curtailment signal of its own to generate one from.
 
 ## Status
 

@@ -19,8 +19,8 @@ _None yet — `engine.py` is currently a verbatim copy._
 | 3 | Export-price sign audit | Confirm negative feed-in (you pay to export) flows through the objective correctly — critical on Amber, which goes negative regularly. |
 | 4 | Solve-time guard | Return the previous plan rather than blocking if a solve exceeds a few seconds. |
 | 5 | Forecast-error headroom | Optionally reserve SOC margin against solar forecast shortfall, rather than trusting a point forecast. |
-| 6 | Curtailment signal | LP currently has no notion of "block export this slot" - needed so the coordinator can drive `async_set_grid_export` from the plan itself rather than a bolt-on rule. |
-| 7 | Islanding safety gate | Wrap `async_go_off_grid` with an SOC floor and daily duration cap before it is callable from anywhere automated - it currently has none. |
+| 6 | Curtailment signal | LP currently has no notion of "block export this slot" - needed so the coordinator can drive `async_curtail_export`/`async_allow_export` from the plan itself rather than a bolt-on rule. |
+| 7 | Islanding safety gate | Wrap the Powerwall adapter's strong-curtailment path (`async_curtail_export(level="strong")`, internally `go_off_grid`) with an SOC floor and daily duration cap before it is callable from anywhere automated - it currently has none. |
 
 ## Deliberately NOT porting from PowerSync
 
