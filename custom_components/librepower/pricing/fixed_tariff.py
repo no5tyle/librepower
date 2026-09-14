@@ -23,34 +23,27 @@ confidently wrong battery decisions, which is worse than refusing to run.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
+from ..time_windows import RecurringWindow
 from .models import PriceForecast, PriceInterval, PricingError
 
 
 @dataclass(frozen=True, slots=True)
 class TouWindow:
-    """A recurring daily rate window in the site's local time.
-
-    ``start`` is inclusive, ``end`` exclusive. A window where ``end <= start``
-    is treated as wrapping past midnight (e.g. 22:00 -> 07:00).
+    """A recurring daily rate window in the site's local time - a
+    ``RecurringWindow`` (the "when") plus the rates that apply inside it
+    (the "how much"). See time_windows.py for the recurrence/midnight-wrap
+    rules themselves; this just carries prices on top.
     """
 
-    start: time
-    end: time
+    window: RecurringWindow
     import_price: float
     export_price: float
-    # Empty means "every day". 0 = Monday, matching datetime.weekday().
-    weekdays: frozenset[int] = field(default_factory=frozenset)
 
     def covers(self, moment: datetime) -> bool:
-        if self.weekdays and moment.weekday() not in self.weekdays:
-            return False
-        clock = moment.time()
-        if self.end <= self.start:  # wraps midnight
-            return clock >= self.start or clock < self.end
-        return self.start <= clock < self.end
+        return self.window.covers(moment)
 
 
 @dataclass(slots=True)

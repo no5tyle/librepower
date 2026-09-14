@@ -62,7 +62,56 @@
           "bridge_start_time_field": "Start time field name",
           "bridge_price_field": "Price field name"
         }
+      },
+      "no_import_windows": {
+        "title": "No-import windows",
+        "description": "Recurring times where the optimiser should avoid drawing from the grid at all - shown regardless of your pricing source, since this is a site policy rather than something tied to a particular tariff. The motivating case is GloBird's ZeroHero plan (a flat daily credit if you draw under ~0.03kWh during evening peak), but this covers any similar contractual or VPP import restriction. Import is capped near-zero, not mathematically zero - a true zero could make a night with heavy load and a low battery unsolvable outright, so a small allowance is kept as an escape valve.\n\nCurrently configured:\n{windows}",
+        "data": {
+          "action": "What would you like to do?"
+        }
+      },
+      "add_no_import_window": {
+        "title": "Add a no-import window",
+        "description": "Start is inclusive, end is exclusive. If end is earlier than start, the window is treated as wrapping past midnight (e.g. 22:00 -> 07:00). Leave the days blank to apply every day.",
+        "data": {
+          "start": "Start time",
+          "end": "End time",
+          "weekdays": "Days (blank = every day)"
+        }
+      },
+      "remove_no_import_window": {
+        "title": "Remove a no-import window",
+        "data": {
+          "window": "Which window?"
+        }
+      },
+      "tou_windows": {
+        "title": "Time-of-use rate windows",
+        "description": "Peak/off-peak/shoulder windows on top of the flat rate you entered during setup, which stays the fallback rate for anything outside every window below. Windows are checked in the order you add them, so put more specific windows before broader ones if they could ever overlap.\n\nCurrently configured:\n{windows}",
+        "data": {
+          "action": "What would you like to do?"
+        }
+      },
+      "add_tou_window": {
+        "title": "Add a rate window",
+        "description": "Start is inclusive, end is exclusive. If end is earlier than start, the window is treated as wrapping past midnight (e.g. 22:00 -> 07:00). Leave the days blank to apply every day. Rates are $/kWh, GST-inclusive, matching your bill - export rate can be negative if your plan charges you to export during this window.",
+        "data": {
+          "start": "Start time",
+          "end": "End time",
+          "weekdays": "Days (blank = every day)",
+          "import_price": "Import rate ($/kWh)",
+          "export_price": "Feed-in rate ($/kWh)"
+        }
+      },
+      "remove_tou_window": {
+        "title": "Remove a rate window",
+        "data": {
+          "window": "Which window?"
+        }
       }
+    },
+    "error": {
+      "window_zero_length": "Start and end time can't be the same - that's neither \"always\" nor \"never\" as a window. Pick two different times."
     }
   }
 }
