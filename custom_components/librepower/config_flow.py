@@ -22,7 +22,10 @@ from homeassistant.helpers import selector
 from .const import (
     CONF_BACKUP_RESERVE,
     CONF_BRIDGE_EXPORT_ENTITY,
+    CONF_BRIDGE_FORECAST_ATTRIBUTE,
     CONF_BRIDGE_IMPORT_ENTITY,
+    CONF_BRIDGE_PRICE_FIELD,
+    CONF_BRIDGE_START_TIME_FIELD,
     CONF_CONTROL_ENABLED,
     CONF_CYCLE_COST,
     CONF_PROVIDER,
@@ -223,6 +226,8 @@ class LibrePowerOptionsFlow(OptionsFlow):
         """Screen 2: site-level optimiser tuning. No hardware specs here."""
         if user_input is not None:
             self._options.update(user_input)
+            if self.config_entry.data.get(CONF_PROVIDER) == PROVIDER_ENTITY_BRIDGE:
+                return await self.async_step_bridge_fields()
             return self.async_create_entry(title="", data=self._options)
 
         current = self.config_entry.options
@@ -246,6 +251,55 @@ class LibrePowerOptionsFlow(OptionsFlow):
                             CONF_WEATHER_AWARE_SOLAR, DEFAULT_WEATHER_AWARE_SOLAR
                         ),
                     ): bool,
+                }
+            ),
+        )
+
+    async def async_step_bridge_fields(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Screen 3, entity-bridge setups only: field names for a source
+        integration that isn't Amber-shaped.
+
+        Only reached when the provider is entity_bridge (async_step_tuning
+        branches here instead of finishing) - a fixed-tariff entry has no
+        bridge to configure and never sees this screen. Defaults match
+        AMBER_PROFILE; see entity_bridge.py's module docstring for the "one
+        validated profile + a custom one" design this fills in the second
+        half of - before this, there was no UI path to ever set these, only
+        dead constants in const.py.
+        """
+        if user_input is not None:
+            self._options.update(user_input)
+            return self.async_create_entry(title="", data=self._options)
+
+        from .pricing.entity_bridge import AMBER_PROFILE
+
+        current = self.config_entry.options
+        return self.async_show_form(
+            step_id="bridge_fields",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_BRIDGE_FORECAST_ATTRIBUTE,
+                        default=current.get(
+                            CONF_BRIDGE_FORECAST_ATTRIBUTE,
+                            AMBER_PROFILE.forecast_attribute,
+                        ),
+                    ): str,
+                    vol.Required(
+                        CONF_BRIDGE_START_TIME_FIELD,
+                        default=current.get(
+                            CONF_BRIDGE_START_TIME_FIELD,
+                            AMBER_PROFILE.start_time_field,
+                        ),
+                    ): str,
+                    vol.Required(
+                        CONF_BRIDGE_PRICE_FIELD,
+                        default=current.get(
+                            CONF_BRIDGE_PRICE_FIELD, AMBER_PROFILE.price_field
+                        ),
+                    ): str,
                 }
             ),
         )

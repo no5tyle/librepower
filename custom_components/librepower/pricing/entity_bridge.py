@@ -26,9 +26,12 @@ module can't be truly zero-configuration for an arbitrary integration it has
 never seen - it ships one **validated profile** (Amber's official core HA
 integration, confirmed against real community-reported attribute output, not
 guessed) and a **custom profile** where the user supplies the field names for
-anything else. Building a fully-automatic schema-sniffing bridge would be
-solving a much harder problem than this project needs; a couple of text
-fields on first setup is a fair trade for supporting integrations we've never
+anything else, via the options flow's "Price sensor field names" screen
+(config_flow.py's ``async_step_bridge_fields`` - kept out of initial setup so
+the common case, Amber, stays a two-field pick there). Building a
+fully-automatic schema-sniffing bridge would be solving a much harder problem
+than this project needs; a few text fields in options is a fair trade for
+supporting integrations we've never
 tested against.
 
 Amber profile, confirmed shape (as of the official core integration)

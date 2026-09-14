@@ -53,6 +53,15 @@
           "cycle_cost": "Battery wear cost ($/kWh cycled)",
           "weather_aware_solar": "Weather-aware solar forecast (Open-Meteo)"
         }
+      },
+      "bridge_fields": {
+        "title": "Price sensor field names",
+        "description": "Only shown because your price source is 'read from an existing integration'. These default to Amber Electric's official integration's shape and normally don't need changing - override them only if you picked sensors from a different forecast-publishing integration (e.g. Octopus, an AEMO spot-price integration) whose attribute is named differently.\n\nForecast attribute: the sensor attribute holding the list of upcoming price intervals.\nStart time field: the key in each interval for its start time.\nPrice field: the key in each interval for its price ($/kWh).",
+        "data": {
+          "bridge_forecast_attribute": "Forecast attribute name",
+          "bridge_start_time_field": "Start time field name",
+          "bridge_price_field": "Price field name"
+        }
       }
     }
   }
