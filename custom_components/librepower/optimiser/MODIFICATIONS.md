@@ -23,7 +23,16 @@ upstream, and it's what makes pulling upstream fixes back in feasible.
 | 4 | Solve-time guard | Return the previous plan rather than blocking if a solve exceeds a few seconds. |
 | 5 | Forecast-error headroom | Optionally reserve SOC margin against solar forecast shortfall, rather than trusting a point forecast. |
 | 6 | Curtailment signal | LP currently has no notion of "block export this slot" - needed so the coordinator can drive `async_curtail_export`/`async_allow_export` from the plan itself rather than a bolt-on rule. |
-| 7 | Islanding safety gate | Wrap the Powerwall adapter's strong-curtailment path (`async_curtail_export(level="strong")`, internally `go_off_grid`) with an SOC floor and daily duration cap before it is callable from anywhere automated - it currently has none. |
+
+Item 7 ("Islanding safety gate") is done - not listed here since it isn't a
+change to the vendored engine at all. It landed in `librepower-powerwall`'s
+`powerwall.py` as `PowerwallIslandingBlockedError`: `async_curtail_export`'s
+strong-curtailment path now refuses to call `go_off_grid` if SOC is below a
+floor (or unknown - fails closed) or the day's islanding-duration cap is
+already used. The SOC floor is `max()`'d against this repo's own
+`backup_reserve` option (wired through in the adapter's `__init__.py`) so a
+user's configured minimum is never undercut for a more consequential action
+than normal operation.
 
 ## Deliberately NOT porting from PowerSync
 
