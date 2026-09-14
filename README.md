@@ -403,7 +403,10 @@ Scaffold. Not yet run against real hardware.
 
 ### Next steps
 
-- [ ] Confirm negative export prices flow correctly through the LP objective
+- [x] Confirm negative export prices flow correctly through the LP objective
+      — audited, no bug found (see optimiser/MODIFICATIONS.md item 3);
+      verified against Amber's own documented sign convention and empirically
+      via a forced-export-at-negative-price scenario
 - [ ] Set a realistic default `cycle_cost` (upstream ships `0.0`)
 - [x] Solar forecast source — history-based clear-sky-index model, always on,
       zero network; Open-Meteo clearness-index adjustment, opt-in, no key
@@ -411,14 +414,27 @@ Scaffold. Not yet run against real hardware.
       active mode)
 - [x] Split into core + battery-adapter repos, with a `BatteryClient`
       contract (`battery.py`) any brand implements against
-- [ ] No unregister path: if a battery adapter is removed while core keeps
-      running, the coordinator has no way to know and keeps a stale
-      reference. `async_register_battery`'s docstring tracks this.
-- [ ] Control-setting live-reload: an adapter reads core's `control_enabled`
-      once, at its own setup time - not automatically reloaded if changed
-      afterwards. See "Taking over control" above.
-- [ ] Fixed-tariff ToU windows in the options flow (currently flat-rate only
-      via the config flow; peak/off-peak windows need adding there too)
+- [x] No unregister path — `async_unregister_battery` added (core) and wired
+      into `librepower-powerwall`'s `async_unload_entry`, called before the
+      client closes, so a removed adapter no longer leaves the coordinator
+      holding a stale, already-closed reference
+- [x] Control-setting live-reload — `librepower-powerwall` now also listens
+      on *core's* entry (not just its own), reloading itself whenever
+      `control_enabled` or `backup_reserve` change in core's options
+- [x] Fixed-tariff ToU windows in the options flow — `async_step_tou_windows`
+      (add/remove/done menu, since HA's config flow has no native
+      repeating-group widget); found and fixed a real bug while wiring this
+      up: `default_import_price`/`default_export_price` were being read
+      from `entry.options` but only ever written to `entry.data`, so every
+      fixed-tariff setup silently got `0.0`/`0.0` and failed to construct
+      at all - not something adding ToU windows caused, but making the ToU
+      parser correct meant looking straight at the code that had this bug
+- [x] Recurring "no-import" windows (`OptimizationConfig.no_import_windows`,
+      `optimiser/MODIFICATIONS.md` item 8) - a general site policy shown
+      regardless of pricing provider, motivated by GloBird's ZeroHero plan
+      (a flat $1/day credit for staying under ~0.03kWh grid draw during
+      evening peak); modeled as a near-zero hard cap on *total* grid draw
+      rather than the exact threshold/bonus mechanic
 - [ ] Battery efficiency learned from telemetry (next item on the learning
       roadmap after solar — `charge_efficiency`/`discharge_efficiency` are
       still a hardcoded 0.90/0.90 in `OptimizationConfig`, never measured)

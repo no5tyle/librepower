@@ -23,7 +23,9 @@ from .const import (
     CONF_BRIDGE_PRICE_FIELD,
     CONF_BRIDGE_START_TIME_FIELD,
     CONF_CYCLE_COST,
+    CONF_NO_IMPORT_WINDOWS,
     CONF_PROVIDER,
+    CONF_TOU_WINDOWS,
     CONF_WEATHER_AWARE_SOLAR,
     DEFAULT_BACKUP_RESERVE,
     DEFAULT_CYCLE_COST,
@@ -44,6 +46,7 @@ from .open_meteo import OpenMeteoClient
 from .optimiser import OptimizationConfig
 from .solar_forecast import HistoricalSolarForecaster
 from .storage import LearningStore
+from .time_windows import RecurringWindow
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -111,6 +114,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         cycle_cost=entry.options.get(CONF_CYCLE_COST, DEFAULT_CYCLE_COST),
         interval_minutes=OPTIMISE_INTERVAL_MINUTES,
         horizon_hours=OPTIMISE_HORIZON_HOURS,
+        no_import_windows=[
+            RecurringWindow.from_dict(raw)
+            for raw in entry.options.get(CONF_NO_IMPORT_WINDOWS, [])
+        ],
+        tzinfo=dt_util_timezone(hass),
     )
 
     coordinator = LibrePowerCoordinator(
@@ -212,32 +220,41 @@ def _build_pricing_client(hass: HomeAssistant, entry: ConfigEntry):
 
 
 def _schedule_from_options(entry: ConfigEntry):
-    """Rebuild a fixed-tariff ToU schedule from stored options."""
-    from datetime import time
+    """Rebuild a fixed-tariff ToU schedule from stored config.
 
+    Bug fixed here: default_import_price/default_export_price were being
+    read from entry.options, but config_flow.py's async_step_fixed_tariff
+    only ever writes them into entry.data (self._data, via _create() ->
+    async_create_entry(data=self._data)) - options.get() for those two keys
+    was therefore always a miss, silently falling back to 0.0/0.0 for
+    *every* fixed-tariff setup. Since TouSchedule.windows was also always
+    empty (no UI ever wrote CONF_TOU_WINDOWS either, until
+    async_step_tou_windows below), FixedTariffProvider.__init__'s
+    "windows empty AND default_import_price <= 0" check meant this path
+    could never actually construct successfully - any fixed-tariff entry
+    would fail at coordinator startup with PricingError, every time.
+    """
     from .pricing.fixed_tariff import TouSchedule, TouWindow
+    from .time_windows import RecurringWindow
 
     windows = []
-    for raw in entry.options.get("tou_windows", []):
+    for raw in entry.options.get(CONF_TOU_WINDOWS, []):
         try:
-            start_h, start_m = (int(p) for p in raw["start"].split(":"))
-            end_h, end_m = (int(p) for p in raw["end"].split(":"))
-        except (KeyError, ValueError):
-            _LOGGER.warning("Skipping malformed ToU window: %s", raw)
-            continue
-        windows.append(
-            TouWindow(
-                start=time(start_h, start_m),
-                end=time(end_h, end_m),
-                import_price=float(raw.get("import_price", 0.0)),
-                export_price=float(raw.get("export_price", 0.0)),
+            windows.append(
+                TouWindow(
+                    window=RecurringWindow.from_dict(raw),
+                    import_price=float(raw.get("import_price", 0.0)),
+                    export_price=float(raw.get("export_price", 0.0)),
+                )
             )
-        )
+        except (KeyError, ValueError) as err:
+            _LOGGER.warning("Skipping malformed ToU window %s: %s", raw, err)
+            continue
 
     return TouSchedule(
         windows=windows,
-        default_import_price=float(entry.options.get("default_import_price", 0.0)),
-        default_export_price=float(entry.options.get("default_export_price", 0.0)),
+        default_import_price=float(entry.data.get("default_import_price", 0.0)),
+        default_export_price=float(entry.data.get("default_export_price", 0.0)),
     )
 
 

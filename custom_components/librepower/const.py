@@ -36,10 +36,29 @@ CONF_BRIDGE_FORECAST_ATTRIBUTE = "bridge_forecast_attribute"
 CONF_BRIDGE_START_TIME_FIELD = "bridge_start_time_field"
 CONF_BRIDGE_PRICE_FIELD = "bridge_price_field"
 
+# Fixed tariff peak/off-peak/shoulder rate windows - fixed_tariff.py's
+# TouSchedule.windows. Stored as a list of dicts: each a
+# time_windows.RecurringWindow.to_dict() plus "import_price"/"export_price"
+# keys (JSON-safe for config entry options). See config_flow.py's
+# async_step_tou_windows for where these are actually set - the flat
+# default_import_price/default_export_price collected at initial setup
+# (fixed_tariff step) remain the fallback rate outside any window.
+CONF_TOU_WINDOWS = "tou_windows"
+
 # Site policy (not hardware - battery physical specs like capacity and max
 # charge/discharge power are reported by whichever battery adapter is
 # registered, via BatteryClient.async_get_capabilities(). See battery.py.)
 CONF_BACKUP_RESERVE = "backup_reserve"
+
+# Recurring "no import" windows - a general site policy independent of
+# pricing provider (dynamic or static pricing alike), not e.g. a
+# fixed-tariff-only setting. GloBird's ZeroHero evening-peak credit is the
+# motivating case (see optimiser/MODIFICATIONS.md and OptimizationConfig's
+# own docstring), but this covers any contractual/VPP import restriction the
+# same way. Stored as a list of time_windows.RecurringWindow.to_dict() dicts
+# (JSON-safe for config entry options) - see config_flow.py's
+# async_step_no_import_windows for where these are actually set.
+CONF_NO_IMPORT_WINDOWS = "no_import_windows"
 
 # Optimiser tuning
 CONF_CYCLE_COST = "cycle_cost"

@@ -12,6 +12,7 @@ doesn't know or care what battery, if any, is attached until one registers.
 """
 from __future__ import annotations
 
+from datetime import time as dtime
 from typing import Any
 
 import voluptuous as vol
@@ -28,7 +29,9 @@ from .const import (
     CONF_BRIDGE_START_TIME_FIELD,
     CONF_CONTROL_ENABLED,
     CONF_CYCLE_COST,
+    CONF_NO_IMPORT_WINDOWS,
     CONF_PROVIDER,
+    CONF_TOU_WINDOWS,
     CONF_WEATHER_AWARE_SOLAR,
     DEFAULT_BACKUP_RESERVE,
     DEFAULT_CONTROL_ENABLED,
@@ -37,6 +40,19 @@ from .const import (
     DOMAIN,
     PROVIDER_ENTITY_BRIDGE,
     PROVIDER_FIXED_TARIFF,
+)
+from .time_windows import RecurringWindow
+
+# 0 = Monday, matching RecurringWindow/datetime.weekday()'s own convention.
+_WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+_WEEKDAY_SELECTOR = selector.SelectSelector(
+    selector.SelectSelectorConfig(
+        options=[
+            selector.SelectOptionDict(value=str(i), label=name)
+            for i, name in enumerate(_WEEKDAY_NAMES)
+        ],
+        multiple=True,
+    )
 )
 
 STEP_PROVIDER = vol.Schema(
@@ -226,9 +242,7 @@ class LibrePowerOptionsFlow(OptionsFlow):
         """Screen 2: site-level optimiser tuning. No hardware specs here."""
         if user_input is not None:
             self._options.update(user_input)
-            if self.config_entry.data.get(CONF_PROVIDER) == PROVIDER_ENTITY_BRIDGE:
-                return await self.async_step_bridge_fields()
-            return self.async_create_entry(title="", data=self._options)
+            return await self.async_step_no_import_windows()
 
         current = self.config_entry.options
         return self.async_show_form(
@@ -303,3 +317,248 @@ class LibrePowerOptionsFlow(OptionsFlow):
                 }
             ),
         )
+
+    # -- no-import windows: general site policy, shown for every provider -----
+
+    async def async_step_no_import_windows(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Screen 3: recurring windows where grid import is hard-capped near
+        zero - e.g. GloBird ZeroHero's evening-peak credit. Shown regardless
+        of pricing provider (dynamic or static) - this is a site policy, not
+        a fixed-tariff-specific one. See OptimizationConfig.no_import_windows
+        in optimiser/engine.py for how it's enforced.
+
+        A menu rather than a single form because the underlying data is a
+        list of arbitrary length - HA's config flow has no native "repeat
+        this group of fields N times" widget, so this loops (add/remove/done)
+        the same way async_step_tou_windows below does for rate windows.
+        """
+        if not hasattr(self, "_no_import_windows"):
+            self._no_import_windows: list[RecurringWindow] = [
+                RecurringWindow.from_dict(raw)
+                for raw in self.config_entry.options.get(CONF_NO_IMPORT_WINDOWS, [])
+            ]
+
+        if user_input is not None:
+            action = user_input["action"]
+            if action == "add":
+                return await self.async_step_add_no_import_window()
+            if action == "remove":
+                return await self.async_step_remove_no_import_window()
+            # done
+            self._options[CONF_NO_IMPORT_WINDOWS] = [
+                w.to_dict() for w in self._no_import_windows
+            ]
+            provider = self.config_entry.data.get(CONF_PROVIDER)
+            if provider == PROVIDER_ENTITY_BRIDGE:
+                return await self.async_step_bridge_fields()
+            if provider == PROVIDER_FIXED_TARIFF:
+                return await self.async_step_tou_windows()
+            return self.async_create_entry(title="", data=self._options)  # pragma: no cover - only 2 providers exist
+
+        actions = {"add": "Add a no-import window", "done": "Done - continue"}
+        if self._no_import_windows:
+            actions["remove"] = "Remove a no-import window"
+        return self.async_show_form(
+            step_id="no_import_windows",
+            data_schema=vol.Schema(
+                {vol.Required("action", default="done"): vol.In(actions)}
+            ),
+            description_placeholders={
+                "windows": _window_list_text(self._no_import_windows)
+            },
+        )
+
+    async def async_step_add_no_import_window(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            window, error = _parse_window_input(user_input)
+            if error:
+                return self._add_no_import_window_form(errors={"base": error})
+            self._no_import_windows.append(window)
+            return await self.async_step_no_import_windows()
+
+        return self._add_no_import_window_form()
+
+    def _add_no_import_window_form(
+        self, errors: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
+        return self.async_show_form(
+            step_id="add_no_import_window",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("start"): selector.TimeSelector(),
+                    vol.Required("end"): selector.TimeSelector(),
+                    vol.Optional("weekdays", default=[]): _WEEKDAY_SELECTOR,
+                }
+            ),
+            errors=errors or {},
+        )
+
+    async def async_step_remove_no_import_window(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            del self._no_import_windows[int(user_input["window"])]
+            return await self.async_step_no_import_windows()
+
+        return self.async_show_form(
+            step_id="remove_no_import_window",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("window"): vol.In(
+                        {
+                            str(i): w.label
+                            for i, w in enumerate(self._no_import_windows)
+                        }
+                    )
+                }
+            ),
+        )
+
+    # -- ToU rate windows: fixed-tariff setups only ----------------------------
+
+    async def async_step_tou_windows(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Final screen, fixed-tariff setups only: peak/off-peak/shoulder
+        rate windows on top of the flat rate collected at initial setup
+        (which remains the fallback outside every window - see
+        pricing/fixed_tariff.py's TouSchedule.rates_at). Only reached when
+        the provider is fixed_tariff; entity_bridge has no tariff schedule
+        of its own to configure and never sees this screen.
+
+        Same add/remove/done menu loop as async_step_no_import_windows,
+        with two extra price fields per window.
+        """
+        if not hasattr(self, "_tou_windows"):
+            from .pricing.fixed_tariff import TouWindow
+
+            self._tou_windows: list[TouWindow] = []
+            for raw in self.config_entry.options.get(CONF_TOU_WINDOWS, []):
+                try:
+                    self._tou_windows.append(
+                        TouWindow(
+                            window=RecurringWindow.from_dict(raw),
+                            import_price=float(raw.get("import_price", 0.0)),
+                            export_price=float(raw.get("export_price", 0.0)),
+                        )
+                    )
+                except (KeyError, ValueError):
+                    continue  # a malformed stored window - __init__.py logs this case; just skip it here
+
+        if user_input is not None:
+            action = user_input["action"]
+            if action == "add":
+                return await self.async_step_add_tou_window()
+            if action == "remove":
+                return await self.async_step_remove_tou_window()
+            # done
+            self._options[CONF_TOU_WINDOWS] = [
+                {**w.window.to_dict(), "import_price": w.import_price, "export_price": w.export_price}
+                for w in self._tou_windows
+            ]
+            return self.async_create_entry(title="", data=self._options)
+
+        actions = {"add": "Add a rate window", "done": "Done - save"}
+        if self._tou_windows:
+            actions["remove"] = "Remove a rate window"
+        return self.async_show_form(
+            step_id="tou_windows",
+            data_schema=vol.Schema(
+                {vol.Required("action", default="done"): vol.In(actions)}
+            ),
+            description_placeholders={
+                "windows": _window_list_text(
+                    self._tou_windows, with_prices=True
+                )
+            },
+        )
+
+    async def async_step_add_tou_window(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            window, error = _parse_window_input(user_input)
+            if error:
+                return self._add_tou_window_form(errors={"base": error})
+            from .pricing.fixed_tariff import TouWindow
+
+            self._tou_windows.append(
+                TouWindow(
+                    window=window,
+                    import_price=float(user_input["import_price"]),
+                    export_price=float(user_input["export_price"]),
+                )
+            )
+            return await self.async_step_tou_windows()
+
+        return self._add_tou_window_form()
+
+    def _add_tou_window_form(
+        self, errors: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
+        return self.async_show_form(
+            step_id="add_tou_window",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("start"): selector.TimeSelector(),
+                    vol.Required("end"): selector.TimeSelector(),
+                    vol.Optional("weekdays", default=[]): _WEEKDAY_SELECTOR,
+                    vol.Required("import_price"): vol.Coerce(float),
+                    vol.Required("export_price"): vol.Coerce(float),
+                }
+            ),
+            errors=errors or {},
+        )
+
+    async def async_step_remove_tou_window(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            del self._tou_windows[int(user_input["window"])]
+            return await self.async_step_tou_windows()
+
+        return self.async_show_form(
+            step_id="remove_tou_window",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("window"): vol.In(
+                        {
+                            str(i): f"{w.window.label}: import ${w.import_price:.3f}, export ${w.export_price:.3f}"
+                            for i, w in enumerate(self._tou_windows)
+                        }
+                    )
+                }
+            ),
+        )
+
+
+def _parse_window_input(
+    user_input: dict[str, Any]
+) -> tuple[RecurringWindow | None, str | None]:
+    """Shared by both add-window steps. Returns (window, None) on success or
+    (None, error_key) on failure - HA's TimeSelector already constrains
+    input to valid HH:MM:SS strings, so the only real failure mode is a
+    window with equal start/end (RecurringWindow would treat that as either
+    "never" or "always", depending on the midnight-wrap check - neither is
+    ever what the user meant to type)."""
+    start = dtime.fromisoformat(user_input["start"])
+    end = dtime.fromisoformat(user_input["end"])
+    if start == end:
+        return None, "window_zero_length"
+    weekdays = frozenset(int(d) for d in user_input.get("weekdays", []))
+    return RecurringWindow(start=start, end=end, weekdays=weekdays), None
+
+
+def _window_list_text(windows: list[Any], with_prices: bool = False) -> str:
+    if not windows:
+        return "(none configured)"
+    if with_prices:
+        return "\n".join(
+            f"- {w.window.label}: import ${w.import_price:.3f}/kWh, export ${w.export_price:.3f}/kWh"
+            for w in windows
+        )
+    return "\n".join(f"- {w.label}" for w in windows)

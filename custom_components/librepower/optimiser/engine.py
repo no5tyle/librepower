@@ -30,9 +30,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo as tzinfo_type
 from enum import Enum
 from typing import Any
+
+# Vendored file's one dependency on the rest of the package - see
+# no_import_windows' own comment for why. No circular-import risk:
+# time_windows.py has no imports back into optimiser/ or pricing/.
+from ..time_windows import RecurringWindow
 
 # Optional dependency - optimization won't work without it
 try:
@@ -81,6 +86,26 @@ class OptimizationConfig:
     # Grid constraints
     max_grid_import_w: float | None = None   # Max grid import power (None = unlimited)
     max_grid_export_w: float | None = None   # Max grid export power (None = unlimited)
+
+    # Recurring "no import" windows (RecurringWindow, from ../time_windows.py)
+    # - site policy independent of pricing provider. GloBird ZeroHero's
+    # evening-peak credit ("draw under ~0.03kWh or lose $1/day") is the
+    # motivating case; modeled as a hard cap rather than the exact
+    # threshold/bonus mechanic (see MODIFICATIONS.md). The cap is a small
+    # nonzero wattage, not literally 0 - reduces (does not eliminate)
+    # infeasibility risk versus a literal 0 cap: the model's load balance is
+    # a hard equality with no unmet-load slack at all (see _solve_lp's
+    # CONSTRAINTS), so a shortfall large enough to exceed available
+    # battery + this allowance is still infeasible by design, same as
+    # max_grid_import_w already could be. A small allowance only helps the
+    # (common) case where the shortfall is itself small.
+    no_import_windows: list[RecurringWindow] = field(default_factory=list)
+    no_import_max_w: float = 200.0
+    # Needed to evaluate no_import_windows in the site's local time - every
+    # timestamp inside the solver is UTC otherwise. timezone.utc is a safe
+    # default for a config with no windows configured (never consulted);
+    # __init__.py always supplies the real site timezone when there are any.
+    tzinfo: tzinfo_type = timezone.utc
 
     # Optimization settings
     cost_function: CostFunction = CostFunction.COST_MINIMIZATION
@@ -452,6 +477,29 @@ class BatteryOptimiser:
                 # else: price <= 0, allow charging (it's free or they pay us!)
             _LOGGER.info("Self-consumption mode: grid charging only when price <= 0")
 
+        # Recurring "no import" windows: which intervals fall inside one,
+        # computed here (bounds section) but enforced as a combined
+        # inequality row further down (INEQUALITY CONSTRAINTS) - total grid
+        # draw (grid_to_load + grid_to_battery together, matching what
+        # GloBird's own rule actually measures) capped near
+        # cfg.no_import_max_w, not exactly 0 (see OptimizationConfig.
+        # no_import_windows' own comment for why). A per-variable bound on
+        # each flow separately would be wrong here: it would allow up to
+        # 2 * no_import_max_w combined (each flow capped independently),
+        # not the single combined household-draw cap GloBird's credit
+        # actually measures. start_time must be timezone-aware for this to
+        # evaluate correctly - guaranteed by the coordinator, which always
+        # supplies a UTC timestamp; only reached at all when windows are
+        # actually configured.
+        no_import_intervals: list[int] = []
+        if cfg.no_import_windows:
+            for t in range(n):
+                moment = (
+                    start_time + timedelta(minutes=cfg.interval_minutes * t)
+                ).astimezone(cfg.tzinfo)
+                if any(w.covers(moment) for w in cfg.no_import_windows):
+                    no_import_intervals.append(t)
+
         # SOC bounds (including gradual recovery ramp, and optional target end SOC)
         min_soc = max(cfg.min_soc, cfg.backup_reserve)
         lb[idx(O_SOC, 0)] = ub[idx(O_SOC, 0)] = initial_soc
@@ -565,6 +613,15 @@ class BatteryOptimiser:
             for t in range(n):
                 add_ub(row, [(idx(O_STG, t), 1.0), (idx(O_BTG, t), 1.0)], cfg.max_grid_export_w)
                 row += 1
+
+        # Recurring "no import" windows (site policy - see BOUNDS section
+        # above for how no_import_intervals was computed). One combined row
+        # per affected interval: total grid draw, not each flow separately -
+        # see that section's comment for why a per-variable bound would have
+        # been wrong here.
+        for t in no_import_intervals:
+            add_ub(row, [(idx(O_GTL, t), 1.0), (idx(O_GTB, t), 1.0)], cfg.no_import_max_w)
+            row += 1
 
         # CRITICAL: Prevent simultaneous grid charging AND battery export
         # This is physically wasteful (round-trip losses) and should never happen -
