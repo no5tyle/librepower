@@ -18,7 +18,10 @@ from .battery import BatteryClient
 from .const import (
     CONF_BACKUP_RESERVE,
     CONF_BRIDGE_EXPORT_ENTITY,
+    CONF_BRIDGE_FORECAST_ATTRIBUTE,
     CONF_BRIDGE_IMPORT_ENTITY,
+    CONF_BRIDGE_PRICE_FIELD,
+    CONF_BRIDGE_START_TIME_FIELD,
     CONF_CYCLE_COST,
     CONF_PROVIDER,
     CONF_WEATHER_AWARE_SOLAR,
@@ -172,13 +175,33 @@ def _build_pricing_client(hass: HomeAssistant, entry: ConfigEntry):
     provider = entry.data.get(CONF_PROVIDER, PROVIDER_FIXED_TARIFF)
 
     if provider == PROVIDER_ENTITY_BRIDGE:
-        from .pricing.entity_bridge import AMBER_PROFILE, EntityBridgeProvider
+        from .pricing.entity_bridge import (
+            AMBER_PROFILE,
+            EntityBridgeFieldMap,
+            EntityBridgeProvider,
+        )
 
+        # Options-flow overrides (LibrePowerOptionsFlow.async_step_bridge_fields)
+        # for a source integration that isn't Amber-shaped; each falls back to
+        # the validated Amber profile's own value when unset, so an
+        # Amber-only entry (no overrides ever saved) still gets AMBER_PROFILE
+        # verbatim.
+        field_map = EntityBridgeFieldMap(
+            forecast_attribute=entry.options.get(
+                CONF_BRIDGE_FORECAST_ATTRIBUTE, AMBER_PROFILE.forecast_attribute
+            ),
+            start_time_field=entry.options.get(
+                CONF_BRIDGE_START_TIME_FIELD, AMBER_PROFILE.start_time_field
+            ),
+            price_field=entry.options.get(
+                CONF_BRIDGE_PRICE_FIELD, AMBER_PROFILE.price_field
+            ),
+        )
         return EntityBridgeProvider(
             hass,
             import_entity_id=entry.data[CONF_BRIDGE_IMPORT_ENTITY],
             export_entity_id=entry.data[CONF_BRIDGE_EXPORT_ENTITY],
-            field_map=AMBER_PROFILE,
+            field_map=field_map,
         )
 
     # Fixed tariff is schedule-driven and needs the rates from options.
