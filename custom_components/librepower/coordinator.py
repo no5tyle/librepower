@@ -77,6 +77,16 @@ SLOT_COUNT = int(OPTIMISE_HORIZON_HOURS * 60 / OPTIMISE_INTERVAL_MINUTES)
 # margin above the internal cap for the construction step.
 SOLVE_TIMEOUT_SECONDS = 45
 
+# Noise floor for the curtailment signal (see
+# _async_apply_export_curtailment) - matches engine.py's own
+# get_action_at_index threshold (10W) for the same "avoid floating-point
+# solver noise" reason, rather than the coarser 50W used by _action_now's
+# disposition thresholds (those decide between charge/discharge/idle -
+# larger amounts of power - so a coarser threshold is appropriate there;
+# curtailment is a binary export/no-export decision where even a small
+# spilled amount is meaningful).
+EXPORT_CURTAIL_THRESHOLD_W = 10.0
+
 
 @dataclass(slots=True)
 class LibrePowerData:
@@ -374,9 +384,10 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
         current SOC internally to force grid charge; core doesn't need to
         know that's how Powerwall does it).
 
-        Export policy (curtail_export/allow_export) is a separate channel -
-        not called from here yet. The LP has no curtailment signal of its
-        own to drive it; see optimiser/MODIFICATIONS.md item 6.
+        Export policy (curtail_export/allow_export) is a separate channel,
+        applied below after the disposition command - a battery can be idle
+        or charging while solar is still being spilled rather than
+        exported, so this isn't tied to any one action branch.
         """
         index = self._slot_index(created)
         if index is None:
@@ -403,6 +414,41 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
             await self._battery.async_release()
         else:  # ACTION_IDLE
             await self._battery.async_hold(snapshot.soc)
+
+        await self._async_apply_export_curtailment(plan, index)
+
+    async def _async_apply_export_curtailment(
+        self, plan: OptimizationResult, index: int
+    ) -> None:
+        """Drive the adapter's soft-curtailment channel from the LP's own
+        curtailed_solar_w signal (see optimiser/MODIFICATIONS.md item 6).
+
+        Only ever requests "soft" curtailment (block export, stay
+        grid-connected) - never "strong" (intentional islanding). Strong
+        curtailment is a safety/manual action gated by its own SOC-floor and
+        daily-duration cap (see PowerwallIslandingBlockedError); it isn't
+        something an ordinary economic optimisation signal should be able to
+        trigger, so this channel doesn't touch it either way.
+
+        This is currently the *only* caller of curtail_export/allow_export,
+        so it owns the channel outright - there's no other caller to
+        conflict with today, but a future one (e.g. a manual override
+        service) would need to coordinate with this rather than assume the
+        channel is idle, since allow_export() is called unconditionally
+        every tick curtailment isn't needed.
+
+        A no-op if the plan is too short to cover this slot (index out of
+        range) - notably always true for the heuristic fallback schedule
+        (used only when scipy/numpy are unavailable), which has no
+        curtailment concept of its own; this leaves the Gateway's export
+        setting exactly as it already was rather than guessing.
+        """
+        if index >= len(plan.curtailed_solar_w):
+            return
+        if plan.curtailed_solar_w[index] > EXPORT_CURTAIL_THRESHOLD_W:
+            await self._battery.async_curtail_export("soft")
+        else:
+            await self._battery.async_allow_export()
 
     def _slot_index(self, created: datetime) -> int | None:
         if created is None:

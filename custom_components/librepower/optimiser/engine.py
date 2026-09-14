@@ -145,6 +145,7 @@ class OptimizationResult:
     solar_to_grid_w: list[float] = field(default_factory=list)      # Solar → Grid (W)
     grid_to_load_w: list[float] = field(default_factory=list)       # Grid → Load (W)
     grid_to_battery_w: list[float] = field(default_factory=list)    # Grid → Battery (W)
+    curtailed_solar_w: list[float] = field(default_factory=list)    # Solar spilled/curtailed rather than exported (W) - see MODIFICATIONS.md item 6
 
     # Timestamps for each interval
     timestamps: list[datetime] = field(default_factory=list)
@@ -456,14 +457,17 @@ class BatteryOptimiser:
         # ========================================
         # VARIABLE LAYOUT
         # ========================================
-        # Seven continuous power-flow variables per interval, an SOC
-        # trajectory of n+1 continuous variables, and n binary "mode"
-        # variables used only to forbid grid-charging and battery-export
-        # happening in the same interval (see CONSTRAINTS below).
+        # Eight continuous power-flow variables per interval (the eighth,
+        # curtailed_solar, is solar production intentionally not captured -
+        # see the "Solar allocation" equality below), an SOC trajectory of
+        # n+1 continuous variables, and n binary "mode" variables used only
+        # to forbid grid-charging and battery-export happening in the same
+        # interval (see CONSTRAINTS below).
         O_STL, O_STB, O_STG = 0, n, 2 * n           # Solar → load / battery / grid
         O_BTL, O_BTG = 3 * n, 4 * n                 # Battery → load (consume) / grid (export)
         O_GTL, O_GTB = 5 * n, 6 * n                 # Grid → load / battery
-        O_SOC = 7 * n                                # n + 1 variables
+        O_CURTAIL = 7 * n                            # Solar → curtailed (not captured)
+        O_SOC = 8 * n                                # n + 1 variables
         O_MODE = O_SOC + (n + 1)                     # n variables
         n_vars = O_MODE + n
 
@@ -561,9 +565,24 @@ class BatteryOptimiser:
             eq_rhs.append(rhs)
 
         row = 0
-        # Solar allocation: all solar must go somewhere
+        # Solar allocation: all forecast solar production must be accounted
+        # for - either used (load/battery), exported, or curtailed. Without
+        # the curtailed term, any solar exceeding load+battery capacity was
+        # FORCED into solar_to_grid regardless of export price, since grid
+        # was the only remaining sink - meaning a negative export price
+        # (being charged to export) couldn't actually be avoided even
+        # though real hardware can curb solar production at the inverter/
+        # Gateway (see PowerwallClient.async_curtail_export's "soft" level).
+        # curtailed_solar has no cost/benefit of its own in the objective
+        # below, so the solver only ever chooses it over exporting when
+        # exporting would cost more than curtailing (i.e. p_export < 0) or
+        # when curtailing and using solar are otherwise equivalent - it
+        # never curtails solar that could profitably be used or exported.
         for t in range(n):
-            add_eq(row, [(idx(O_STL, t), 1.0), (idx(O_STB, t), 1.0), (idx(O_STG, t), 1.0)], solar[t])
+            add_eq(row, [
+                (idx(O_STL, t), 1.0), (idx(O_STB, t), 1.0), (idx(O_STG, t), 1.0),
+                (idx(O_CURTAIL, t), 1.0),
+            ], solar[t])
             row += 1
 
         # Load satisfaction: load must be covered by solar, battery, or grid
@@ -662,6 +681,10 @@ class BatteryOptimiser:
         MIN_WORTHWHILE_EXPORT = 0.10  # Don't export battery unless price > this
 
         c = np.zeros(n_vars)
+        # curtailed_solar (O_CURTAIL) deliberately gets no coefficient here -
+        # see the "Solar allocation" equality's own comment for why leaving
+        # it at zero cost is exactly what makes the solver choose it only
+        # when exporting would actually cost money.
 
         # Cost components (common to all objectives): import_cost - export_revenue,
         # where grid_import = grid_to_load + grid_to_battery and
@@ -775,6 +798,7 @@ class BatteryOptimiser:
         battery_to_grid_vals = np.maximum(x[O_BTG:O_BTG + n], 0).tolist()
         grid_to_load_vals = np.maximum(x[O_GTL:O_GTL + n], 0).tolist()
         grid_to_battery_vals = np.maximum(x[O_GTB:O_GTB + n], 0).tolist()
+        curtailed_solar_vals = np.maximum(x[O_CURTAIL:O_CURTAIL + n], 0).tolist()
 
         # SANITY CHECK: the mode[t] constraint makes simultaneous grid charge and
         # battery export structurally infeasible, but MILP solves have finite
@@ -845,6 +869,7 @@ class BatteryOptimiser:
             solar_to_grid_w=solar_to_grid_vals,
             grid_to_load_w=grid_to_load_vals,
             grid_to_battery_w=grid_to_battery_vals,
+            curtailed_solar_w=curtailed_solar_vals,
             timestamps=timestamps,
             total_cost=total_cost,
             total_import_kwh=total_import_kwh,
