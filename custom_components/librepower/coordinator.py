@@ -26,6 +26,7 @@ Two update loops, deliberately separate:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -64,6 +65,17 @@ from .solar_geometry import clear_sky_ghi_estimate
 _LOGGER = logging.getLogger(__name__)
 
 SLOT_COUNT = int(OPTIMISE_HORIZON_HOURS * 60 / OPTIMISE_INTERVAL_MINUTES)
+
+# Outer defense-in-depth guard on top of engine.py's own internal solver
+# cap (SOLVER_TIMEOUT there, currently 30s, enforced via HiGHS's own
+# time_limit option). That cap only bounds HiGHS's solve loop itself, not
+# the problem construction (numpy/sparse-matrix building) that happens
+# before it, nor a HiGHS/scipy release regression that fails to honour its
+# own time_limit - both have happened to other projects using
+# scipy.optimize.milp. This is the actual backstop that keeps
+# async_refresh_plan from hanging the coordinator indefinitely; extra
+# margin above the internal cap for the construction step.
+SOLVE_TIMEOUT_SECONDS = 45
 
 
 @dataclass(slots=True)
@@ -275,9 +287,29 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
         load = self._loads.forecast(start, SLOT_COUNT)
 
         # The LP is pure CPU and can take ~1s. Never run it on the event loop.
-        plan = await self.hass.async_add_executor_job(
-            self._solve, imports, exports, solar, load, snapshot.soc, start
-        )
+        # wait_for is a backstop on top of the solve, not a replacement for
+        # it - see SOLVE_TIMEOUT_SECONDS' own comment for why both exist.
+        # Note this can only stop *waiting*, not the underlying executor
+        # thread (Python's thread pool has no cancellation) - a truly
+        # wedged solve keeps one thread busy in the background rather than
+        # being killed. What this actually buys is the coordinator's own
+        # async loop never hanging: it keeps ticking, keeps serving
+        # telemetry, and tries again next cycle, same as any other
+        # solve failure.
+        try:
+            plan = await asyncio.wait_for(
+                self.hass.async_add_executor_job(
+                    self._solve, imports, exports, solar, load, snapshot.soc, start
+                ),
+                timeout=SOLVE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "Optimiser solve exceeded %ss, keeping previous plan",
+                SOLVE_TIMEOUT_SECONDS,
+            )
+            self._record_error(f"Optimiser timed out after {SOLVE_TIMEOUT_SECONDS}s")
+            return
 
         if not plan.success:
             _LOGGER.warning("Optimiser returned no schedule: %s", plan.status)

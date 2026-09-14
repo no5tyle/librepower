@@ -20,7 +20,6 @@ upstream, and it's what makes pulling upstream fixes back in feasible.
 |---|--------|-----|
 | 1 | Drop the `server.py` Flask layer | We call the engine in-process; no HTTP hop, no add-on container. Already excluded from the vendor copy. |
 | 2 | Set a non-zero default `cycle_cost` | Upstream defaults to `0.0`, so the LP will happily cycle the battery for a fraction of a cent. Real LFP wear is ~1-3c/kWh throughput. |
-| 4 | Solve-time guard | Return the previous plan rather than blocking if a solve exceeds a few seconds. |
 | 5 | Forecast-error headroom | Optionally reserve SOC margin against solar forecast shortfall, rather than trusting a point forecast. |
 | 6 | Curtailment signal | LP currently has no notion of "block export this slot" - needed so the coordinator can drive `async_curtail_export`/`async_allow_export` from the plan itself rather than a bolt-on rule. |
 
@@ -48,6 +47,22 @@ already used. The SOC floor is `max()`'d against this repo's own
 `backup_reserve` option (wired through in the adapter's `__init__.py`) so a
 user's configured minimum is never undercut for a more consequential action
 than normal operation.
+
+Item 4 ("Solve-time guard") is done - not listed above since, like item 7,
+it isn't a change to the vendored engine itself. `engine.py` already had its
+own internal cap (`SOLVER_TIMEOUT = 30`, enforced via HiGHS's `time_limit`
+option) and `coordinator.py` already kept the previous plan on any solve
+failure - what was missing was an *outer* backstop, since the internal cap
+only bounds HiGHS's own solve loop, not the problem-construction time before
+it, nor a HiGHS/scipy release regression that fails to honour its own
+`time_limit`. `coordinator.py`'s `async_refresh_plan` now wraps the solve's
+executor call in `asyncio.wait_for(..., timeout=SOLVE_TIMEOUT_SECONDS)`
+(45s - extra margin above the internal 30s cap); a timeout is treated the
+same as any other solve failure (previous plan kept, error recorded). Note
+this only stops *waiting* on the executor future, not the underlying thread
+itself (Python's thread pool has no cancellation) - a truly wedged solve
+still occupies one executor thread in the background, but the coordinator's
+own async loop no longer hangs on it.
 
 ## Deliberately NOT porting from PowerSync
 
