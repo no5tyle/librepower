@@ -183,6 +183,32 @@ class LibrePowerCoordinator(DataUpdateCoordinator[LibrePowerData]):
         # entities should populate right away.
         await self.async_request_refresh()
 
+    async def async_unregister_battery(self, battery: BatteryClient) -> None:
+        """Detach the currently registered battery adapter.
+
+        Called from the adapter's own ``async_unload_entry`` (via
+        ``__init__.py``'s module-level ``async_unregister_battery``) before
+        it closes its client, so a later coordinator tick doesn't keep
+        calling into a connection that's already been torn down - see
+        ``async_register_battery``'s docstring for the gap this closes.
+
+        Only clears if ``battery`` is actually the one currently
+        registered - a mismatch (a stale/late unload call racing a fresh
+        registration, however unlikely given ``async_set_battery`` refuses
+        a second registration while one exists) is logged and otherwise
+        ignored rather than clearing someone else's live registration.
+        Idempotent: unregistering when nothing (or a different battery) is
+        registered is a harmless no-op either way.
+        """
+        if self._battery is not battery:
+            _LOGGER.debug(
+                "async_unregister_battery called with a battery that isn't "
+                "the one currently registered - ignoring (already replaced, "
+                "or a stale/late call)."
+            )
+            return
+        self._battery = None
+
     @property
     def _control_mode(self) -> str:
         """Whether we are permitted to write to the battery."""
