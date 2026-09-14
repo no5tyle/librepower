@@ -268,14 +268,44 @@ async def async_register_battery(
     entry - the adapter should treat that as "core isn't set up yet" and
     surface ConfigEntryNotReady, not something core itself can recover from.
 
-    Not yet handled: what happens if the battery adapter is later removed
-    while core keeps running. Core has no "unregister" path yet - the
-    coordinator just keeps its last-known BatteryClient reference, which will
-    start failing on its next call. Worth revisiting before relying on this
-    for a setup where the battery adapter might be uninstalled independently.
+    See ``async_unregister_battery`` below for the teardown counterpart -
+    call that from the adapter's own ``async_unload_entry`` before closing
+    its client, so core doesn't keep a stale reference after the adapter is
+    gone.
     """
     coordinator: LibrePowerCoordinator = hass.data[DOMAIN][core_entry_id]
     await coordinator.async_set_battery(battery)
+
+
+async def async_unregister_battery(
+    hass: HomeAssistant, core_entry_id: str, battery: BatteryClient
+) -> None:
+    """The cross-repo teardown counterpart to ``async_register_battery``.
+
+    A battery adapter integration calls this from its own
+    ``async_unload_entry``, *before* closing its client, so core's
+    coordinator stops holding a reference to a connection that's about to be
+    torn down - without this, the coordinator's next telemetry tick would
+    call into an already-closed client and fail repeatedly rather than
+    cleanly returning to its pre-registration "waiting for a battery" state.
+
+    Typical caller (a battery adapter's own ``__init__.py``)::
+
+        from custom_components.librepower import async_unregister_battery
+        await async_unregister_battery(hass, core_entry_id, my_powerwall_client)
+        await my_powerwall_client.async_close()
+
+    Unlike ``async_register_battery``, a missing/unloaded core entry is not
+    an error here - it just means there's nothing left to unregister from
+    (the common case being both integrations removed together, in either
+    unload order), so this is a silent no-op rather than raising KeyError.
+    """
+    coordinator: LibrePowerCoordinator | None = hass.data.get(DOMAIN, {}).get(
+        core_entry_id
+    )
+    if coordinator is None:
+        return
+    await coordinator.async_unregister_battery(battery)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
