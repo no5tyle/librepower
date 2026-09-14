@@ -19,10 +19,24 @@ upstream, and it's what makes pulling upstream fixes back in feasible.
 |---|--------|-----|
 | 1 | Drop the `server.py` Flask layer | We call the engine in-process; no HTTP hop, no add-on container. Already excluded from the vendor copy. |
 | 2 | Set a non-zero default `cycle_cost` | Upstream defaults to `0.0`, so the LP will happily cycle the battery for a fraction of a cent. Real LFP wear is ~1-3c/kWh throughput. |
-| 3 | Export-price sign audit | Confirm negative feed-in (you pay to export) flows through the objective correctly — critical on Amber, which goes negative regularly. |
 | 4 | Solve-time guard | Return the previous plan rather than blocking if a solve exceeds a few seconds. |
 | 5 | Forecast-error headroom | Optionally reserve SOC margin against solar forecast shortfall, rather than trusting a point forecast. |
 | 6 | Curtailment signal | LP currently has no notion of "block export this slot" - needed so the coordinator can drive `async_curtail_export`/`async_allow_export` from the plan itself rather than a bolt-on rule. |
+
+Item 3 ("Export-price sign audit") is done - audited, not fixed, since it
+found no bug. Confirmed against Amber's own documentation (negative feedIn
+`per_kwh` = charged/debited for exporting, positive = paid) that the entire
+pipeline - `entity_bridge.py`'s raw sensor read (no transform), `models.py`'s
+`PriceInterval.export_price` (already documented as "positive when paid,
+negative when charged"), `coordinator.py`'s passthrough into the optimiser,
+and `engine.py`'s `export_revenue = p_export * grid_export` (subtracted from
+cost, so a negative `p_export` correctly *increases* total cost) plus
+`_calculate_baseline_cost` - is sign-consistent throughout, with no flip at
+any stage. Verified empirically too: a forced-export scenario (full battery,
+solar surplus, nowhere else for it to go) at a negative export price
+produces a positive `total_cost` (a real cost, not a phantom credit), and
+the identical physical scenario at a positive export price produces a lower
+`total_cost` than the negative-price case, as expected either way.
 
 Item 7 ("Islanding safety gate") is done - not listed here since it isn't a
 change to the vendored engine at all. It landed in `librepower-powerwall`'s
