@@ -112,8 +112,16 @@ class OptimizationConfig:
     interval_minutes: int = 5             # Time interval in minutes
     horizon_hours: int = 48               # Optimization horizon in hours
 
-    # Degradation penalty (optional)
-    cycle_cost: float = 0.0               # Cost per kWh cycled (for battery wear)
+    # Degradation penalty (optional). Upstream defaulted this to 0.0, which
+    # lets the LP cycle the battery for a fraction of a cent of arbitrage -
+    # real LFP wear is more like 1-3c/kWh of throughput. __init__.py always
+    # supplies this explicitly (from const.py's own DEFAULT_CYCLE_COST,
+    # also 0.02 - kept in sync deliberately, not by coincidence), so this
+    # default is normally never consulted in production; it's set to match
+    # anyway so a future direct OptimizationConfig() construction (a test,
+    # a script, a new caller) doesn't silently regress to encouraging
+    # pointless cycling by omission.
+    cycle_cost: float = 0.02               # Cost per kWh cycled (for battery wear)
 
 
 @dataclass
