@@ -394,8 +394,12 @@ adapter interface" above for what each means and why they take a target SOC
 rather than a bare direction. That's the disposition channel; the LP's
 richer output (planned charge/discharge *rate*, specifically) isn't
 commanded, only used to decide direction and target. The export-policy
-channel (curtailment) isn't driven by the coordinator yet — the LP has no
-curtailment signal of its own to generate one from.
+channel is driven separately, every tick, from the LP's own
+`curtailed_solar_w` signal: `async_curtail_export("soft")` when the plan
+spills solar rather than exporting it that slot, `async_allow_export()`
+otherwise — see `optimiser/MODIFICATIONS.md` item 6. Only "soft"
+curtailment is ever requested this way; "strong" (intentional islanding) is
+reserved for a safety/manual trigger, not an ordinary economic signal.
 
 ## Status
 
@@ -406,8 +410,14 @@ Scaffold. Not yet run against real hardware.
 - [x] Confirm negative export prices flow correctly through the LP objective
       — audited, no bug found (see optimiser/MODIFICATIONS.md item 3);
       verified against Amber's own documented sign convention and empirically
-      via a forced-export-at-negative-price scenario
-- [ ] Set a realistic default `cycle_cost` (upstream ships `0.0`)
+      via `_calculate_baseline_cost` (updated post-curtailment; see that
+      item's note on why the original forced-export scenario no longer
+      applies once solar can be curtailed instead)
+- [x] Set a realistic default `cycle_cost` — `OptimizationConfig.cycle_cost`'s
+      own dataclass default moved from upstream's `0.0` to `0.02`, matching
+      `const.py`'s `DEFAULT_CYCLE_COST` (already `0.02`) rather than relying
+      solely on `__init__.py` always overriding it (see
+      `optimiser/MODIFICATIONS.md`, item 2)
 - [x] Solar forecast source — history-based clear-sky-index model, always on,
       zero network; Open-Meteo clearness-index adjustment, opt-in, no key
 - [x] Write the plan back to the registered battery (backup-reserve control,
@@ -435,6 +445,16 @@ Scaffold. Not yet run against real hardware.
       (a flat $1/day credit for staying under ~0.03kWh grid draw during
       evening peak); modeled as a near-zero hard cap on *total* grid draw
       rather than the exact threshold/bonus mechanic
+- [x] Outer solve-time guard — `async_refresh_plan` now wraps the solve's
+      executor call in `asyncio.wait_for(timeout=SOLVE_TIMEOUT_SECONDS=45s)`
+      as a backstop on top of `engine.py`'s own internal 30s HiGHS
+      `time_limit`; a timeout is treated the same as any other solve
+      failure (previous plan kept, error recorded) rather than hanging the
+      coordinator (see `optimiser/MODIFICATIONS.md` item 4)
+- [x] Curtailment signal — the LP now has a `curtailed_solar_w` decision
+      variable (item 6), and the coordinator drives
+      `async_curtail_export("soft")`/`async_allow_export()` from it every
+      tick, replacing the previously-unused channel
 - [ ] Battery efficiency learned from telemetry (next item on the learning
       roadmap after solar — `charge_efficiency`/`discharge_efficiency` are
       still a hardcoded 0.90/0.90 in `OptimizationConfig`, never measured)
