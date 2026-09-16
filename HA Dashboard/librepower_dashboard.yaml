@@ -86,6 +86,46 @@ views:
             name: Selling at
             icon: mdi:transmission-tower-export
 
+      # -- price forecast, as a chart -------------------------------------
+      # Reads the forecast array published in
+      # sensor.librepower_import_price's attributes (sensor.py's
+      # _price_forecast_attrs) - the raw provider curve the plan below was
+      # optimised against, not the plan's own decisions. Each point carries
+      # its own absolute start time (providers use different interval
+      # widths - Amber's is 5 minutes, a fixed tariff's is 30 - so unlike
+      # the plan chart there's no fixed slot grid to compute against).
+      # Requires apexcharts-card.
+      - type: custom:apexcharts-card
+        header:
+          show: true
+          title: Price forecast
+        graph_span: 48h
+        span:
+          start: minute
+        yaxis:
+          - id: price
+            decimals: 3
+            apex_config:
+              title:
+                text: $/kWh
+        series:
+          - entity: sensor.librepower_import_price
+            name: Import price
+            yaxis_id: price
+            type: line
+            color: '#ff9800'
+            data_generator: |
+              const forecast = entity.attributes.forecast || [];
+              return forecast.map(f => [new Date(f.start).getTime(), f.import_price]);
+          - entity: sensor.librepower_import_price
+            name: Export price
+            yaxis_id: price
+            type: line
+            color: '#2196f3'
+            data_generator: |
+              const forecast = entity.attributes.forecast || [];
+              return forecast.map(f => [new Date(f.start).getTime(), f.export_price]);
+
       # -- the plan, as a chart -----------------------------------------
       # Reads the schedule array published in
       # sensor.librepower_planned_action's attributes (coordinator.py's

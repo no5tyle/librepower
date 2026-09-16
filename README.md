@@ -499,15 +499,18 @@ losing weeks of learned load history on every restart.
 
 A preconfigured Lovelace dashboard lives in `HA Dashboard/librepower_dashboard.yaml`
 — battery/solar/load gauges, live power flows, current buy/sell price, a
-24-hour schedule chart (planned SOC + planned charge/discharge), and the
-optimiser's cost-vs-baseline for the current plan.
+48-hour price forecast chart (the raw import/export curve a provider
+returned, keyed by each interval's own timestamp rather than a fixed grid,
+since providers don't all use the same interval width), a 24-hour schedule
+chart (planned SOC + planned charge/discharge), and the optimiser's
+cost-vs-baseline for the current plan.
 
 **One extra card required:** `apexcharts-card` via HACS → Frontend. That's
 the whole dependency list — everything else is built into Home Assistant.
 PowerSync's dashboard needs four extra cards (button-card, card-mod,
-power-flow-card-plus, apexcharts-card); this needs one, because the schedule
-chart is the only thing a stock card genuinely can't do — rendering an array
-from an attribute as a time series.
+power-flow-card-plus, apexcharts-card); this needs one, because the two
+charts are the only things a stock card genuinely can't do — rendering an
+array from an attribute as a time series.
 
 Install: Settings → Dashboards → Add Dashboard → New dashboard from scratch →
 three-dot menu → Edit in YAML → paste the file's content. Entity IDs assume a
