@@ -62,7 +62,7 @@ class RecurringWindow:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "RecurringWindow":
+    def from_dict(cls, data: dict[str, Any]) -> RecurringWindow:
         return cls(
             start=time.fromisoformat(data["start"]),
             end=time.fromisoformat(data["end"]),

@@ -30,7 +30,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone, tzinfo as tzinfo_type
+from datetime import datetime, timedelta, timezone
+from datetime import tzinfo as tzinfo_type
 from enum import Enum
 from typing import Any
 
@@ -340,7 +341,12 @@ class BatteryOptimiser:
         cfg = config or self.config
 
         if start_time is None:
-            start_time = datetime.now()
+            # Every timestamp elsewhere in the solver is UTC (see
+            # no_import_windows' own comment) - this fallback only matters
+            # for callers that don't supply start_time (coordinator.py
+            # always does), so it should match, not drift into naive/local
+            # time that'd silently misalign no_import_windows evaluation.
+            start_time = datetime.now(timezone.utc)
 
         n_intervals = len(prices_import)
         if not all(len(x) == n_intervals for x in [prices_export, solar_forecast, load_forecast]):
@@ -370,10 +376,10 @@ class BatteryOptimiser:
             return result
 
         except Exception as e:
-            _LOGGER.error(f"Optimization failed: {e}", exc_info=True)
+            _LOGGER.exception("Optimization failed")
             return OptimizationResult(
                 success=False,
-                status=f"Solver error: {str(e)}",
+                status=f"Solver error: {e!s}",
             )
 
     def _solve_lp(
@@ -979,10 +985,13 @@ class BatteryOptimiser:
             stg = remaining_solar
 
             # High export price and low solar - discharge to export
-            if prices_export[t] > avg_export * 1.3 and prices_export[t] > 0.10:
-                if current_soc > cfg.backup_reserve + 0.1:
-                    available_energy = (current_soc - cfg.backup_reserve) * capacity_wh / dt_hours
-                    btg = min(cfg.max_discharge_w, available_energy)
+            if (
+                prices_export[t] > avg_export * 1.3
+                and prices_export[t] > 0.10
+                and current_soc > cfg.backup_reserve + 0.1
+            ):
+                available_energy = (current_soc - cfg.backup_reserve) * capacity_wh / dt_hours
+                btg = min(cfg.max_discharge_w, available_energy)
 
             # Cover remaining load from battery or grid
             if remaining_load > 0:
