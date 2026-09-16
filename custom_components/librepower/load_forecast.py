@@ -103,7 +103,7 @@ class LoadForecaster:
         }
 
     @classmethod
-    def from_dict(cls, data: dict, interval_minutes: int) -> "LoadForecaster":
+    def from_dict(cls, data: dict, interval_minutes: int) -> LoadForecaster:
         forecaster = cls(interval_minutes)
         if data.get("interval_minutes") != interval_minutes:
             # Interval changed; old slot indices are meaningless. Start fresh.

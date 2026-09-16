@@ -16,7 +16,12 @@ from datetime import time as dtime
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.core import callback
 from homeassistant.helpers import selector
 
@@ -81,7 +86,7 @@ class LibrePowerConfigFlow(ConfigFlow, domain=DOMAIN):
 
     @staticmethod
     @callback
-    def async_get_options_flow(entry: ConfigEntry) -> "LibrePowerOptionsFlow":
+    def async_get_options_flow(entry: ConfigEntry) -> LibrePowerOptionsFlow:
         return LibrePowerOptionsFlow()
 
     # -- step 1: choose pricing source ---------------------------------------

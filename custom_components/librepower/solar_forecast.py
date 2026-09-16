@@ -152,7 +152,7 @@ class HistoricalSolarForecaster:
     @classmethod
     def from_dict(
         cls, data: dict, latitude: float, longitude: float, interval_minutes: int
-    ) -> "HistoricalSolarForecaster":
+    ) -> HistoricalSolarForecaster:
         forecaster = cls(latitude, longitude, interval_minutes)
         if data.get("interval_minutes") != interval_minutes:
             _LOGGER.debug("Solar history discarded: interval changed")
