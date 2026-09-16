@@ -54,6 +54,45 @@ def _price_now(data: LibrePowerData, export: bool = False) -> float | None:
     return round(current.export_price if export else current.import_price, 4)
 
 
+def _price_forecast_attrs(data: LibrePowerData) -> dict[str, Any]:
+    """Expose the raw price forecast for dashboard charting.
+
+    Distinct from _plan_attrs' schedule: that's the optimiser's *decisions*
+    (what the battery will do), keyed by slot number against a fixed
+    OPTIMISE_INTERVAL_MINUTES grid. This is the *input* prices those
+    decisions were made from, keyed by each interval's own absolute start
+    time - providers don't all use the same interval width (Amber's is 5
+    minutes, a fixed tariff's is 30), so slot-number math doesn't apply
+    here the way it does for the plan.
+    """
+    if data.prices is None:
+        return {"provider": None}
+    # Note: PriceForecast.__len__ delegates to len(intervals), so an
+    # empty-but-not-None forecast is falsy - `data.prices.provider` (not a
+    # truthiness check on data.prices itself) is what's needed here to
+    # still report the provider name for an empty forecast.
+    if not data.prices.intervals:
+        return {"provider": data.prices.provider}
+
+    # A provider forecast isn't bounded the way the optimiser's own
+    # resampled horizon is (OPTIMISE_HORIZON_HOURS) - cap defensively so a
+    # provider returning a very long or very fine-grained curve can't blow
+    # out this attribute's size. 200 comfortably covers 48h even at a
+    # 15-minute native resolution.
+    intervals = data.prices.intervals[:200]
+    return {
+        "provider": data.prices.provider,
+        "forecast": [
+            {
+                "start": interval.start.isoformat(),
+                "import_price": round(interval.import_price, 4),
+                "export_price": round(interval.export_price, 4),
+            }
+            for interval in intervals
+        ],
+    }
+
+
 def _plan_attrs(data: LibrePowerData) -> dict[str, Any]:
     """Expose the upcoming schedule for dashboard charting."""
     if data.plan is None or not data.plan.success:
@@ -135,6 +174,10 @@ SENSORS: tuple[LibrePowerSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement="AUD/kWh",
         value_fn=lambda d: _price_now(d, export=False),
+        # Carries the full forecast (import + export together, see
+        # _price_forecast_attrs) rather than duplicating it onto
+        # export_price too - one source of truth for dashboard charting.
+        attrs_fn=_price_forecast_attrs,
     ),
     LibrePowerSensorDescription(
         key="export_price",
